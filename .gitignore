@@ -8,3 +8,4 @@ watch/Config/Local.xcconfig
 watch/*.xcodeproj/
 xcuserdata/
 DerivedData/
+.tools/
