@@ -13,4 +13,11 @@ public enum Haptics {
         }
         #endif
     }
+
+    /// First tap on a long-task done tile ("tap again to clear").
+    static func armed() {
+        #if os(watchOS)
+        WKInterfaceDevice.current().play(.click)
+        #endif
+    }
 }

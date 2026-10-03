@@ -88,7 +88,7 @@ public struct CardPresentation: Identifiable, Hashable, Sendable {
             default: headline = "Needs input"
             }
             timerLabel = "waiting"
-            timerStart = clock.localDate(serverMs: card.waitingSince ?? card.updatedAt)
+            timerStart = clock.localDate(serverMs: card.waitingSince ?? card.startedAt ?? card.updatedAt)
             if let started = card.startedAt, let since = card.waitingSince, since >= started {
                 detail = "ran \(DurationFormat.short(ms: since - started)) before"
             }
