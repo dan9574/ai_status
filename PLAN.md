@@ -56,7 +56,7 @@
 - 阶段一 ✅ 完成（分支 `phase1-daemon`）：守护进程、钩子、HTTP/SSE API、终端查看器，`npm test` 44 项 + e2e。
 - 阶段二 ✅ 已上真机（Apple Watch SE 3，watchOS 26.6）：`watch/` 下的 watchOS 应用 + 小组件。第一版（列表 + 点开详情卡片）试用后觉得太复杂，改为单屏色块设计（分支 `watch-tiles`，已合并）。
   - 色块第二版（分支 `watch-tiles-v2`，2026-10-03）：按开始时间固定位置（去掉“等待优先”的重要度排序）；色块只显示工具图标 + 名称和 `run/ask/done · 计时`；深色调配色；点按任意色块看详情；左滑露出垃圾桶删除（任何状态，唯一删除方式），去掉点按清除/再点一次。macOS 上 `watch/scripts/check.sh` 451 项通过，40/44 mm 预览图已更新，签名真机构建成功（未安装）。**待真机确认**：田字格窄色块里的左滑与点按/长按是否冲突、触感、常亮显示和安全区、图标在手表上的清晰度。
-- 阶段三 🟡 代码完成、Windows 端未实测（分支 `phase3-multihost`）：远程钩子（token）、`machine` 字段与按电脑区分的会话 id、旧 state.json 兼容、子代理未结束时保持 running、`aistatus token` / `remote-setup`、Windows PowerShell 转发与安装脚本。macOS 上已验证：`npm test` 74 项、`scripts/e2e.mjs`、`scripts/e2e-remote.mjs`。**未验证**：PowerShell 脚本在 Windows 上的实际运行、Codex Windows 版执行钩子的 shell、信任界面。
+- 阶段三 ✅ 已实测（2026-10-03）：Windows 上的 Codex 桌面版通过局域网把钩子事件上报到 Mac（令牌校验），手表上显示为独立一格；子代理未结束时保持 running；Mac 上 Codex 钩子已信任。
 - 阶段四 ⏸ 搁置：后台刷新 / 推送。改用“应用常驻前台当默认屏幕”的做法后暂不需要。
 
 ## 当前环境
