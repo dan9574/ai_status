@@ -4,7 +4,9 @@
   sessions show up on the Mac running aistatusd (and on the watch).
 
 .DESCRIPTION
-  1. Writes %USERPROFILE%\.aistatus\config.json  { host, port, token, machine }
+  1. Writes %USERPROFILE%\.aistatus\config.json  { host, port, url, token, machine }
+     ("url" is set with -BaseUrl, e.g. a public https URL such as Tailscale
+     Funnel's; when set, hooks go there instead of http://host:port)
   2. Copies aistatus-hook.ps1 to %USERPROFILE%\.aistatus\aistatus-hook.ps1
      (from ..\hooks\ or this folder; when run without a file, e.g. via the
      one-line install, it is downloaded from http://<MacHost>:<Port>/setup/).
@@ -15,13 +17,15 @@
 
   The hook command line is constant:
     powershell -NoProfile -ExecutionPolicy Bypass -File C:/Users/<you>/.aistatus/aistatus-hook.ps1
-  so re-running with a new IP/port/token only rewrites config.json and Codex
-  does not ask to trust the hooks again.
+  so re-running with a new IP/port/URL/token only rewrites config.json (and
+  refreshes the hook script file) and Codex does not ask to trust the hooks again.
 
   Compatible with Windows PowerShell 5.1. Keep this file ASCII-only.
 
 .EXAMPLE
   powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\install-windows.ps1 -MacHost 192.168.1.20 -Token abc123
+.EXAMPLE
+  powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\install-windows.ps1 -BaseUrl https://mac.tailnet.ts.net -Token abc123
 .EXAMPLE
   powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\install-windows.ps1 -Uninstall
 #>
@@ -29,6 +33,7 @@
 param(
     [string]$MacHost,
     [int]$Port = 0,
+    [string]$BaseUrl,
     [string]$Token,
     [string]$Machine,
     [switch]$Uninstall,
@@ -37,6 +42,8 @@ param(
 
 $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
+# Windows PowerShell 5.1 (.NET Framework) may not offer TLS 1.2 by default; https URLs need it.
+try { [System.Net.ServicePointManager]::SecurityProtocol = [System.Net.ServicePointManager]::SecurityProtocol -bor [System.Net.SecurityProtocolType]::Tls12 } catch { }
 
 # Windows PowerShell 5.1 serialises arrays as {"value":[...],"Count":n} when
 # this extended type data is present; removing it keeps ConvertTo-Json sane.
@@ -175,6 +182,23 @@ function Update-CodexHooks([bool]$Install) {
     else { Write-Host "codex: removed aistatus hooks from $CodexHooks" }
 }
 
+function ConvertTo-BaseUrl([string]$Raw) {
+    # Accepts http(s)://host[:port][/]; returns it without the trailing slash.
+    $u = $null
+    if (-not [System.Uri]::TryCreate($Raw.Trim(), [System.UriKind]::Absolute, [ref]$u)) { throw "-BaseUrl '$Raw' is not a URL (example: https://mac.tailnet.ts.net)" }
+    if ($u.Scheme -ne 'https' -and $u.Scheme -ne 'http') { throw "-BaseUrl must start with https:// (or http://)" }
+    if ($u.UserInfo -or $u.Query -or $u.Fragment -or ($u.AbsolutePath -ne '/')) { throw "-BaseUrl must be just scheme://host[:port], without path, query or credentials" }
+    if ($u.Scheme -eq 'http') { Write-Warning '-BaseUrl uses plain http: the token is sent unencrypted. Prefer the https URL.' }
+    return $u.GetLeftPart([System.UriPartial]::Authority)
+}
+
+function Get-BaseUri($cfg) {
+    if ($cfg.url) { return ([string]$cfg.url).TrimEnd('/') }
+    $h = [string]$cfg.host
+    if ($h.Contains(':') -and -not $h.StartsWith('[')) { $h = '[' + $h + ']' }
+    return "http://${h}:$($cfg.port)"
+}
+
 function Install-HookScript([string]$MacHostForDownload, [int]$PortForDownload) {
     $candidates = @()
     if ($PSScriptRoot) {
@@ -185,6 +209,8 @@ function Install-HookScript([string]$MacHostForDownload, [int]$PortForDownload) 
     if ($src) {
         $text = [System.IO.File]::ReadAllText($src)
     } else {
+        # The public URL never serves setup files: only the Mac's LAN port does.
+        if (-not $MacHostForDownload) { throw 'aistatus-hook.ps1 not found next to this script; copy hooks\aistatus-hook.ps1 from the repo (keep the folder layout), or run the one-line install from the same network as the Mac (-MacHost <ip>).' }
         $h = $MacHostForDownload
         if ($h.Contains(':') -and -not $h.StartsWith('[')) { $h = '[' + $h + ']' }
         $url = "http://${h}:${PortForDownload}/setup/aistatus-hook.ps1"
@@ -201,15 +227,13 @@ function Install-HookScript([string]$MacHostForDownload, [int]$PortForDownload) 
 function Test-Remote($cfg) {
     # Sends a SessionStart for a dummy session: it creates no visible card on the
     # watch, but proves address, port, firewall and token in one request.
-    $h = [string]$cfg.host
-    if ($h.Contains(':') -and -not $h.StartsWith('[')) { $h = '[' + $h + ']' }
-    $uri = "http://${h}:$($cfg.port)/hook/codex?machine=" + [System.Uri]::EscapeDataString([string]$cfg.machine)
+    $uri = (Get-BaseUri $cfg) + '/hook/codex?machine=' + [System.Uri]::EscapeDataString([string]$cfg.machine)
     $body = [System.Text.Encoding]::UTF8.GetBytes('{"session_id":"aistatus-install-check","hook_event_name":"SessionStart","source":"startup"}')
     try {
         $req = [System.Net.HttpWebRequest][System.Net.WebRequest]::Create($uri)
         $req.Method = 'POST'
         $req.ContentType = 'application/json; charset=utf-8'
-        $req.Timeout = 3000
+        $req.Timeout = 5000
         $req.Proxy = $null
         $req.ContentLength = $body.Length
         if ($cfg.token) { $req.Headers.Add('Authorization', 'Bearer ' + [string]$cfg.token) }
@@ -222,7 +246,9 @@ function Test-Remote($cfg) {
         switch ($code) {
             401 { Write-Warning 'test: the Mac rejected the token (401). Check it with `aistatus token` on the Mac.' }
             403 { Write-Warning 'test: the Mac has remote hooks disabled (403). On the Mac run `aistatus token --new --hooks-only` and restart the daemon.' }
-            0 { Write-Warning "test: cannot reach $uri ($($_.Exception.Message)). Same network? Mac awake? macOS firewall allowing node? Daemon running?" }
+            429 { Write-Warning 'test: too many wrong tokens recently (429); wait a minute, then check the token with `aistatus token` on the Mac.' }
+            502 { Write-Warning 'test: the tunnel answered but the daemon did not (502). On the Mac: `aistatus public-status`.' }
+            0 { if ($cfg.url) { Write-Warning "test: cannot reach $uri ($($_.Exception.Message)). Is the Mac awake, the daemon running and the tunnel (tailscale funnel) on? Check with ``aistatus public-status`` on the Mac." } else { Write-Warning "test: cannot reach $uri ($($_.Exception.Message)). Same network? Mac awake? macOS firewall allowing node? Daemon running?" } }
             default { Write-Warning "test: unexpected HTTP $code from $uri" }
         }
     } catch {
@@ -238,18 +264,24 @@ if ($Uninstall) {
 }
 
 # Merge parameters over an existing config so re-running with only -Token works.
+# -BaseUrl sets "url" (hooks then go there); -MacHost without -BaseUrl switches
+# back to the LAN address (removes "url"); neither keeps the previous choice.
 $old = $null
 try { $old = Read-JsonObject $ConfigFile } catch { Write-Warning "ignoring unreadable $ConfigFile" }
+$Url = ''
+if ($BaseUrl) { $Url = ConvertTo-BaseUrl $BaseUrl }
+elseif (-not $MacHost -and $old -and $old.url) { $Url = [string]$old.url }
 if (-not $MacHost -and $old) { $MacHost = [string]$old.host }
 if ($Port -le 0) { if ($old -and $old.port) { $Port = [int]$old.port } else { $Port = 7778 } }
 if (-not $PSBoundParameters.ContainsKey('Token') -and $old) { $Token = [string]$old.token }
 if (-not $Machine) { if ($old -and $old.machine) { $Machine = [string]$old.machine } else { $Machine = [string]$env:COMPUTERNAME } }
-if (-not $MacHost) { throw 'missing -MacHost <Mac IP address> (run `aistatus remote-setup` on the Mac to see it)' }
+if (-not $MacHost -and -not $Url) { throw 'missing -MacHost <Mac IP address> or -BaseUrl <https://...> (run `aistatus remote-setup` on the Mac to see them)' }
 if (-not $Token) { Write-Warning 'no -Token given: the Mac will refuse these hooks until a token is configured on both sides.' }
 
-$cfg = [pscustomobject]@{ host = $MacHost; port = $Port; token = $Token; machine = $Machine }
+$cfg = [pscustomobject]@{ host = $MacHost; port = $Port; url = $Url; token = $Token; machine = $Machine }
 Write-Utf8File $ConfigFile ((ConvertTo-Json -InputObject $cfg) + "`n")
-Write-Host "config: $ConfigFile (host=$MacHost port=$Port machine=$Machine)"
+if ($Url) { Write-Host "config: $ConfigFile (url=$Url machine=$Machine)" }
+else { Write-Host "config: $ConfigFile (host=$MacHost port=$Port machine=$Machine)" }
 
 Install-HookScript $MacHost $Port
 if (-not (Test-Path -LiteralPath $CodexDir)) { Write-Warning "$CodexDir does not exist yet (is Codex installed and started once?); creating it." }
