@@ -80,7 +80,7 @@ async function live({ host, port }) {
     const width = out.columns || 80;
     const n = snapshot?.sessions?.length ?? 0;
     const head = `aistatus · ${n} card${n === 1 ? '' : 's'} · ${new Date().toLocaleTimeString()} · ${status}`;
-    const body = snapshot ? renderCards(snapshot, { now, color: tty, width }) : '';
+    const body = snapshot ? renderCards(snapshot, { now, color: !!tty, width }) : '';
     const frame = `${head}\n\n${body}\n\n\x1b[2m q quit · aistatus dismiss <id>\x1b[0m`;
     if (tty) out.write('\x1b[H\x1b[2J' + frame);
     else out.write(frame + '\n');
@@ -171,7 +171,7 @@ export async function main(argv = process.argv.slice(2)) {
         if (flags.json) console.log(JSON.stringify(r.body, null, 2));
         else {
           const skew = r.body.serverTime - Date.now();
-          console.log(renderCards(r.body, { now: Date.now() + skew, color: process.stdout.isTTY, width: process.stdout.columns || 100 }));
+          console.log(renderCards(r.body, { now: Date.now() + skew, color: !!process.stdout.isTTY, width: process.stdout.columns || 100 }));
         }
       } catch (e) {
         notRunning(host, port, e);
