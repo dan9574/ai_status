@@ -31,8 +31,10 @@ node bin/aistatus.js                        # 另开终端：实时卡片视图�
 | `aistatus daemon [--port N] [--no-bonjour]` | 前台运行守护进程 |
 | `aistatus install-hooks` / `uninstall-hooks` | 安装 / 卸载钩子 |
 | `aistatus install-daemon [--print]` | 生成 launchd plist（不加载） |
-| `aistatus token [--new [--hooks-only]]` | 打印远程钩子要用的 token；`--new` 生成并保存（见[多台电脑](#多台电脑windows)） |
-| `aistatus remote-setup` | 打印另一台电脑需要的全部信息：Mac 局域网 IP、端口、token、Windows 安装命令 |
+| `aistatus token [--read] [--new [--hooks-only \| --shared]]` | 打印远程钩子要用的 token（`--read`：手表要用的 `token`）；`--new` 生成并保存 `token`，`--new --hooks-only` 生成 `hookToken`，`--new --shared` 生成 `token` 并删除 `hookToken`（一个 token 管所有）（见[多台电脑](#多台电脑windows)、[公网地址](#公网地址tailscale-funnel)） |
+| `aistatus remote-setup [--public-url URL]` | 打印另一台电脑需要的全部信息：Mac 局域网 IP、端口、token、Windows 安装命令；配置了 `publicUrl` 时安装命令改用 `-BaseUrl <公网地址>` |
+| `aistatus public-url [URL \| --clear]` | 查看 / 保存公网地址（例如 `https://danielmacbook-air.tail66228a.ts.net`），只给 CLI 用，守护进程不读 |
+| `aistatus public-status [--show] [--no-probe]` | 公网监听端口是否在运行、token 是否已设置（`--show` 才打印 token 本身）、本机和公网地址的 `/health` 能否访问 |
 
 ### 配置 `~/.aistatus/config.json`（均可省略）
 
@@ -44,6 +46,8 @@ node bin/aistatus.js                        # 另开终端：实时卡片视图�
   "bonjour": true,
   "token": null,
   "hookToken": null,
+  "publicPort": 7779,
+  "publicUrl": null,
   "machine": null,
   "codex": { "source": "auto", "pollMs": 1500 },
   "idlePruneHours": 24,
@@ -54,10 +58,12 @@ node bin/aistatus.js                        # 另开终端：实时卡片视图�
 - `swipeThresholdSec`：运行时长低于此值的已完成卡片 `dismissPolicy = "swipe"`，否则 `"confirm"`。
 - `token`：设置后，非本机客户端（手表）需带 `Authorization: Bearer <token>` 或 `?token=<token>`；本机永远放行。它同时也允许别的电脑推送钩子（除非另设了 `hookToken`）。
 - `hookToken`：只用于别的电脑推送钩子（`POST /hook/:tool`）。设置后远程钩子必须带它（此时 `token` 不再被远程钩子接受），读取接口不受影响。`token` 和 `hookToken` 都没设时，远程钩子一律 `403`。
+- `publicPort`：公网监听端口（给 Tailscale Funnel 之类的隧道用），**只绑定 127.0.0.1**，只有配置了（至少 16 个字符的）`token` 或 `hookToken` 才会启动，否则不启动并在日志里写明原因；设为 `false` 关闭。这个端口上**不按来源地址信任任何请求**，见[公网地址](#公网地址tailscale-funnel)。
+- `publicUrl`：隧道的公网地址（`aistatus public-url` 写入），只给 `remote-setup` / `public-status` 用。
 - `machine`：本机在卡片 `machine` 字段里的名字，默认取主机名去掉 `.local`（例如 `DanieldeMacBook-Air-2`）。
 - `subagentTimeoutMin`：主回合已结束、但子代理还在跑的会话保持 running；若这么多分钟内没有任何事件（例如丢了 `SubagentStop`），按最后一次事件的时间记为 done。
 - `codex.source`：`auto`（钩子优先，会话文件监听兜底）/ `hooks` / `watcher`。
-- 环境变量覆盖：`AISTATUS_PORT`、`AISTATUS_HOST`、`AISTATUS_BONJOUR=0`、`AISTATUS_CODEX_SOURCE`、`AISTATUS_DIR`（数据目录）。
+- 环境变量覆盖：`AISTATUS_PORT`、`AISTATUS_HOST`、`AISTATUS_PUBLIC_PORT`（`off` 关闭）、`AISTATUS_BONJOUR=0`、`AISTATUS_CODEX_SOURCE`、`AISTATUS_DIR`（数据目录）。
 - 状态持久化在 `~/.aistatus/state.json`（原子写入），守护进程重启后卡片不丢。旧版本（阶段一/二）写的 state.json 可以直接加载，其中的会话都算本机会话。
 - **升级到这个版本后**：重启守护进程，并重新执行一次 `node bin/aistatus.js install-hooks`，才会装上新增的 `SubagentStart` / `SubagentStop` 钩子（已有条目不变）。Codex 只需要在 `/hooks` 里信任这两条**新增**的条目；已经信任过的条目定义没变，信任仍然有效。
 
@@ -161,7 +167,9 @@ data: {"version":1,"serverTime":…,"sessions":[…]}
 
 `{"ok":true,"name":"aistatusd","version":"0.1.0","machine":"DanieldeMacBook-Air-2","remoteHooks":false,"pid":…,"startedAt":…,"serverTime":…,"sessions":3,"sseClients":1}`
 
-`remoteHooks`：当前进程是否接受别的电脑推送钩子（配置了 `hookToken` 或 `token`）。
+`remoteHooks`：当前进程是否接受别的电脑推送钩子（配置了 `hookToken` 或 `token`）。局域网端口上还有 `"public":{"listening":true,"port":7779,"read":true,"hook":true}`（公网监听端口的状态）。
+
+公网监听端口上：不带有效 token 只返回 `{"ok":true}`；带读取 token（`token`）返回上面的完整信息（不含 `pid` 和 `public`）。
 
 ### `POST /hook/:tool`
 
@@ -172,11 +180,11 @@ data: {"version":1,"serverTime":…,"sessions":[…]}
 
 ### `GET /setup/aistatus-hook.ps1`、`GET /setup/install-windows.ps1`
 
-返回仓库里的这两个 PowerShell 脚本（`text/plain`，不需要 token，不含任何秘密），供 Windows 上一行命令安装。
+返回仓库里的这两个 PowerShell 脚本（`text/plain`，不需要 token，不含任何秘密），供 Windows 上一行命令安装。**只在局域网端口提供**，公网监听端口不提供。
 
 ### 错误与认证
 
-错误响应为 `{"error":"…"}`。配置了 `token` 时，非本机请求缺少/错误 token 返回 `401`。
+错误响应为 `{"error":"…"}`。配置了 `token` 时，非本机请求缺少/错误 token 返回 `401`。公网监听端口的规则不同（所有请求都要 token），见[公网地址](#公网地址tailscale-funnel)。
 
 ## 钩子转发脚本
 
@@ -197,7 +205,7 @@ data: {"version":1,"serverTime":…,"sessions":[…]}
 - **用户按 Esc 中断 Claude**：文档中 `Stop` 定义为“Claude 完成回复时”，中断时很可能不触发（未实测），此时卡片会停在 running，直到下一个 prompt 或手动 dismiss。Codex 有 `Interrupt` 钩子，不受影响。
 - 代理进程崩溃/被杀且没有 `Stop`/`SessionEnd` 时，卡片同样会停留，需手动 dismiss。
 - `PostToolUse` 每次工具调用都会触发一次 curl（同步，约 10–45ms）。
-- 默认无认证：局域网内任何人都能读取项目名、路径、消息摘要并 dismiss；在不可信网络请设置 `token`。仅 IPv4 `0.0.0.0` 监听。远程钩子默认关闭，需要 token 才能打开。
+- 默认无认证：局域网内任何人都能读取项目名、路径、消息摘要并 dismiss；在不可信网络请设置 `token`。仅 IPv4 `0.0.0.0` 监听。远程钩子默认关闭，需要 token 才能打开。公网监听端口（`7779`，只绑 127.0.0.1）没有 token 不启动，所有请求都要 token。
 - Codex 钩子与会话文件中的 session id 是否一致未验证（通过 `transcript_path` 去重兜底）；Codex 桌面版里钩子信任界面如何出现未验证。
 - 卡片排序、时间都由服务器给出绝对时间；手表需自行处理时钟偏差（用 `serverTime`）。
 
@@ -211,7 +219,7 @@ Windows: Codex ─钩子→ aistatus-hook.ps1 ─HTTP POST（Bearer token）→ 
 
 ### 前提
 
-- 两台电脑在**同一个局域网**（同一个 Wi-Fi / 路由器），Windows 能访问 Mac 的 IP。公司网络里如果开了客户端隔离（AP isolation），两台机器互相访问不了，这个功能就用不了。
+- 两台电脑在**同一个局域网**（同一个 Wi-Fi / 路由器），Windows 能访问 Mac 的 IP。公司 / 学校网络里如果开了客户端隔离（AP isolation），两台机器互相访问不了：这时改用[公网地址](#公网地址tailscale-funnel)。
 - 建议在路由器里给 Mac 固定 IP（DHCP 保留），否则 Mac 的 IP 变了要在 Windows 上重新运行安装脚本（只改配置文件，不需要重新信任钩子）。
 
 ### 第一步：Mac 上
@@ -256,7 +264,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\install-windows.ps
 powershell -NoProfile -ExecutionPolicy Bypass -File "C:/Users/<你>/.aistatus/aistatus-hook.ps1"
 ```
 
-转发脚本从标准输入读原始字节（不经过控制台代码页，中文不会乱码），POST 到 `http://<Mac>:<端口>/hook/codex?machine=<电脑名>`，带 `Authorization: Bearer <token>`，每一步网络超时 1 秒、不走代理；无论成功失败都**没有任何输出、退出码 0**，不会阻塞或影响 Codex。
+转发脚本从标准输入读原始字节（不经过控制台代码页，中文不会乱码），POST 到 `http://<Mac>:<端口>/hook/codex?machine=<电脑名>`，带 `Authorization: Bearer <token>`，每一步网络超时 1 秒、不走代理（配置了 `url` 时改发到 `<url>/hook/codex?…`，每步 1.4 秒，见[公网地址](#公网地址tailscale-funnel)）；无论成功失败都**没有任何输出、退出码 0**，不会阻塞或影响 Codex。
 
 ### 第三步：在 Codex 里信任钩子（一次）
 
@@ -280,6 +288,86 @@ Codex 对新钩子按定义的哈希做信任校验，未信任的钩子会被�
 
 已在本机验证（`node scripts/e2e-remote.mjs`）：用 curl 对 Mac 的局域网 IP 发送与 PowerShell 脚本完全相同的请求（同样的 URL、请求头、UTF-8 原始字节），覆盖 403 / 401 / 200、完整的 Codex 回合（含子代理）、中文文本、同一 sessionId 在两台电脑上不冲突、电脑名回退与清洗、手表方式的 dismiss、重启后持久化、Mac 不可达时发送方 1 秒左右放弃，以及一行安装命令要下载的两个脚本。
 
+## 公网地址（Tailscale Funnel）
+
+学校 / 公司 Wi-Fi 常常禁止设备之间互访（客户端隔离），手表（经 iPhone）和 Windows 电脑都连不到 Mac 的 `7778`。办法：用 **Tailscale Funnel** 把守护进程放到一个固定的公网 HTTPS 地址上，例如 `https://danielmacbook-air.tail66228a.ts.net`。Funnel 在 Tailscale 那边终止 TLS，再把请求转发到 Mac 上 `127.0.0.1` 的一个端口。
+
+```
+手表 ─HTTPS─┐                          ┌→ 127.0.0.1:7779 公网监听端口（每个请求都要 token）
+Windows ─HTTPS┴→ Tailscale Funnel 中继 ─┘   127.0.0.1/局域网:7778 原来的端口（行为不变）
+```
+
+### 为什么是单独的端口
+
+反向代理转发过来的请求在守护进程看来**全部来自 127.0.0.1**。而 `7778` 信任回环地址（本机钩子和 CLI 不需要 token），如果把隧道指向 `7778`，等于整个互联网都能读你的会话、推送钩子、删除卡片。所以守护进程另开一个**公网监听端口**（`publicPort`，默认 `7779`）：
+
+- 只绑定 `127.0.0.1`，局域网上也访问不到；只有隧道（或本机进程）能连。
+- 只有配置了 token 才启动；没有 token 时不启动，并在日志里写 `public listener not started: no token configured…`。
+- **不按来源地址信任任何请求**：每个接口都要 `Authorization: Bearer <token>`（常数时间比较）；**不接受** `?token=`。
+- 例外只有 `GET /health`：不带有效 token 时只返回 `{"ok":true}`，不含任何细节（方便检查隧道是否通）。
+- 不提供 `/setup/*.ps1`，也不提供任何含 token 的内容。
+- 从这个端口进来的钩子一律算**远程钩子**：电脑名取 `?machine=` / `X-AIStatus-Machine`，都没有时取代理追加的客户端 IP（`X-Forwarded-For` 最右边一项），再没有就是 `remote`；**永远不会**被当成本机会话（即使电脑名和 Mac 同名，id 也是 `codex@<名字>:<id>`）。
+- 加固：请求体上限 1 MiB（钩子；dismiss 16 KiB），超过返回 `413`；同时最多 8 个 SSE 连接，再多返回 `503`；同一客户端（按 `X-Forwarded-For` 最右项区分，没有则按连接地址）1 分钟内 10 次**错误 token** 之后返回 `429`，直到这一分钟结束（完全没带 `Authorization` 的请求——例如扫描器——只返回 `401`，不计数，避免把你自己的手表锁在外面）；请求头 10 秒、整个请求 30 秒超时；最多 64 个连接。
+- 日志里不会出现 token（也不记录查询字符串）。
+- `7778` 的行为**完全不变**：本机钩子和 CLI 照常不需要 token。
+
+### token 的含义
+
+| 配置 | 公网端口上的读取（`/sessions`、`/events`、完整 `/health`、dismiss） | 公网端口上的钩子（`POST /hook/:tool`） |
+|---|---|---|
+| 只有 `token` | `token` | `token`（一个 token 管所有） |
+| `token` + `hookToken` | 只认 `token` | 只认 `hookToken`（`token` 不行） |
+| 只有 `hookToken` | 全部拒绝（`401`） | `hookToken` |
+
+- 推荐两个分开：手表里只有读取 token，Windows 上只有钩子 token，任一个泄露影响面更小。`aistatus token --new` 生成 `token`，`aistatus token --new --hooks-only` 生成 `hookToken`；想用一个就 `aistatus token --new --shared`。
+- 公网端口只接受至少 16 个字符的 token（`--new` 生成的是 32 个字符）。
+- 设置了 `token` 后，局域网上（非本机）的读取也需要它（和以前一样）。
+
+### 上线步骤
+
+1. **Mac：生成 token 并重启守护进程**
+   ```sh
+   cd ~/projects/ai_status
+   node bin/aistatus.js token --new                # "token"：手表用（已有就不用再生成，否则旧 token 失效）
+   node bin/aistatus.js token --new --hooks-only   # "hookToken"：Windows 用（已有就不用再生成）
+   launchctl kickstart -k gui/$(id -u)/com.aistatus.daemon
+   node bin/aistatus.js public-status              # 应显示 public listener up on 127.0.0.1:7779
+   ```
+2. **Mac：打开 Funnel（你自己执行，aistatus 不会碰 Tailscale）**
+   ```sh
+   tailscale funnel --bg 7779
+   node bin/aistatus.js public-url https://danielmacbook-air.tail66228a.ts.net
+   node bin/aistatus.js public-status              # public probe: … HTTP 200 {"ok":true}，with token: OK
+   ```
+   注意是 `7779`（公网监听端口），**不要**把 Funnel 指向 `7778`。
+3. **手表：把地址和 token 编进应用**（不用在手表上输入 32 位 token）
+   ```sh
+   cd watch
+   ./scripts/generate.sh --host https://danielmacbook-air.tail66228a.ts.net --token "$(node ../bin/aistatus.js token --read)"
+   ```
+   然后在 Xcode 里重新装到手表。`https://` 地址不写端口就是 443（设置里的端口只用于局域网 http）。如果以前在手表设置里改过主机或 token，手表会继续用你改过的值：长按 → 设置，点 “Use https://…” 和 “Use built-in token”。
+4. **Windows：改用公网地址**：`aistatus remote-setup` 会打印带 `-BaseUrl` 的安装命令。新版转发脚本必须到 Windows 上（旧版不认 `url`）：在和 Mac 同一网络时用一行命令安装（它从局域网端口下载脚本；公网地址不提供脚本），或者把 `hooks\aistatus-hook.ps1`、`scripts\install-windows.ps1` 拷过去执行：
+   ```bat
+   powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\install-windows.ps1 -BaseUrl https://danielmacbook-air.tail66228a.ts.net -Token "<hookToken>"
+   ```
+   配置文件多了 `"url"`，转发脚本优先用它（`https`、不写端口，显式开启 TLS 1.2，每步超时 1.4 秒）；`-MacHost <ip>` 且不带 `-BaseUrl` 重新运行即切回局域网。**钩子命令行和 `timeout` 没变，`hooks.json` 里的条目和以前完全一样，Codex 不需要重新信任**（只要 Windows 上已经装过阶段三的版本）。
+
+### 经过第三方的数据
+
+- 所有流量经过 Tailscale 的 Funnel 中继服务器。按 Tailscale 的说明，TLS 在你 Mac 上的 `tailscaled` 终止（证书和私钥在 Mac 上），中继只按 SNI 转发加密的 TCP 流、看不到内容；它能看到的是连接元数据：手表 / Windows 的公网 IP、连接时间和流量大小。内容的保密依赖 Tailscale 的实现和 Tailscale 软件本身（`tailscaled` 解密后再转给 `127.0.0.1:7779`），经过的内容包括：项目名、会话状态和时间、最后一条消息摘要（最多 160 字）、Windows 的 `cwd` 路径和电脑名、钩子原始 JSON（含提示词、工具名、工具输出片段），以及 token（在请求头里）。
+- 公网地址的主机名会出现在公开的证书透明度日志里，任何人都可能找到它并来扫描；没有 token 只能拿到 `{"ok":true}` 和 `401`。
+- token 只在 HTTPS 里传输；`public-status` 只有在地址是 `https://` 时才发 token 做测试。
+- 不想用时：`tailscale funnel --bg 7779 off`（或 `tailscale funnel reset`），并可在配置里设 `"publicPort": false`。
+
+已在本机验证：`test/public.test.js`（无 token 不启动、未认证 401、错误 token / `?token=`、读取、`hookToken` 与读取 token 的分工、最小 `/health`、不提供安装脚本、请求体上限、SSE 上限、错误 token 限流、`7778` 行为不变、日志不含 token）；`node scripts/e2e-public.mjs`（独立守护进程 + 模拟 Funnel 的本地反向代理，覆盖上述各项、按 PowerShell 脚本格式发送的远程钩子、SSE 推送、手表方式的 dismiss、CLI 的 `public-status` / `remote-setup`）；`watch/scripts/check.sh`（`https://` 地址解析、所有请求包括 SSE 都带 Bearer、`generate.sh` 的转义与 Xcode 展开结果）；用假地址和假 token 做的 watchOS 真机构建，构建产物 Info.plist 里是完整的 `https://…` 和 token。
+
+### 尚未验证
+
+- 真实的 Tailscale Funnel 没有在这里测试（按要求没有碰 Tailscale）。本机用一个模拟隧道的本地反向代理测试过（`scripts/e2e-public.mjs`）。
+- Funnel 是否附带 `X-Forwarded-For`（以及是不是真实客户端 IP）未确认；没有的话所有公网客户端共享一个“错误 token 计数”，有人故意发错 token 时可能让你的手表也暂时收到 `429`（最多 1 分钟）。
+- 手表经 iPhone 走 HTTPS 时 SSE 是否被缓冲（已有 8 秒无快照退回轮询的兜底）；Funnel 对长连接的空闲超时（守护进程每 15 秒发心跳）。
+- Windows 上的 `url` / TLS 1.2 分支没有实际运行过（这里没有 Windows / PowerShell）。转发脚本不走系统代理（`Proxy = $null`）；如果学校网络强制走 HTTP 代理才能上外网，钩子会发不出去。
+
 ## 开发
 
 ```
@@ -294,6 +382,8 @@ hooks/aistatus-hook.ps1     Windows 钩子转发脚本（PowerShell 5.1）
 scripts/install-windows.ps1 Windows 安装/卸载脚本
 scripts/e2e.mjs       端到端检查（临时 HOME，默认端口 17778）
 scripts/e2e-remote.mjs 远程钩子端到端检查（临时 HOME，默认端口 17790，用 curl 打本机局域网 IP）
+scripts/e2e-public.mjs 公网监听端口端到端检查（临时 HOME，端口 17800/17801/17802，全部只绑 127.0.0.1，带一个模拟 Funnel 的本地反向代理）
+test/public.test.js    公网监听端口的单元测试
 ```
 
 测试与 e2e 只使用临时 HOME，不会修改真实的 `~/.claude`、`~/.codex` 或加载 launchd 任务。
@@ -345,7 +435,7 @@ scripts/e2e-remote.mjs 远程钩子端到端检查（临时 HOME，默认端口 
 
 预览图（macOS 上离屏渲染，40 mm = 162×197 pt，44 mm = 184×224 pt；右上角的 10:09、详情页左上角的 ✕ 和圆角是模拟的系统元素和屏幕形状）：[`watch/previews/`](watch/previews)——`tiles-0/1/2/3/4/6`、`tiles-3-swiped` / `tiles-4-swiped`（左滑露出垃圾桶）、`detail-done/ask/run`、`tiles-3-offline`、`tiles-4-always-on`、各状态页，总览见 `overview-40mm.png` / `overview-44mm.png`。
 
-- **设置**：主机、端口（默认 7778）、token（可选），`@AppStorage` 持久化。主机只写名字会自动补 `.local`（`Daniels-MacBook-Air` → `Daniels-MacBook-Air.local`），也接受 IP、`host:port`、带 `http://` 的写法；“Test connection” 调 `/health`。构建时 `generate.sh` 会把本机的 Bonjour 名写进 Info.plist 作为默认主机，**手表上通常不用打字**。
+- **设置**：主机、端口（默认 7778）、token（可选），`@AppStorage` 持久化。主机只写名字会自动补 `.local`（`Daniels-MacBook-Air` → `Daniels-MacBook-Air.local`），也接受 IP、`host:port`、带 `http://` 的写法，以及完整的 `https://` 地址（例如 Funnel 地址；不写端口即 443，此时设置里的端口不用）；“Test connection” 调 `/health`。构建时 `generate.sh` 会把默认主机（本机的 Bonjour 名，或 `--host` 给的地址）和 `--token` 给的 token 写进 Info.plist（`AIStatusDefaultHost` / `AIStatusDefaultToken`），**手表上通常不用打字**；用户在设置里改过的值优先，设置里有 “Use …” / “Use built-in token” 按钮恢复成内置值。所有请求（包括 SSE）都带 `Authorization: Bearer <token>`。
 - **小组件**：`accessoryRectangular / Circular / Inline / Corner`，显示 running / waiting / done 计数和“as of 时间”；数据来自应用最后一次写入 App Group 的快照（计数变化时才刷新时间线）。小组件自己不联网，所以它只和你上次打开应用时一样新（后台刷新是阶段三）。
 
 ### 网络
@@ -354,7 +444,7 @@ scripts/e2e-remote.mjs 远程钩子端到端检查（临时 HOME，默认端口 
 - 应用进入后台（`scenePhase == .background`）即断开；抬腕回来自动重连。
 - 时钟偏差：每份快照的 `serverTime` 与本地收到时刻（轮询取往返中点）求差，取最近 5 个样本的中位数，所有时间戳换算成本地时间再交给计时文本。
 - 没有使用 Bonjour 浏览：普通 watchOS 应用基本拿不到 Network.framework 的 NWBrowser/NWConnection，所以手动主机是基线。
-- Info.plist：`NSAppTransportSecurity → NSAllowsLocalNetworking = YES`（允许明文 HTTP 到 `.local`、不带点的主机名和局域网 IP；**故意没有**加 `NSAllowsArbitraryLoads`，两者同时存在时后者会被忽略）、`NSLocalNetworkUsageDescription`、`NSBonjourServices = _aistatus._tcp`、`WKApplication`、`WKWatchOnly`。
+- Info.plist：`NSAppTransportSecurity → NSAllowsLocalNetworking = YES`（允许明文 HTTP 到 `.local`、不带点的主机名和局域网 IP；**故意没有**加 `NSAllowsArbitraryLoads`，两者同时存在时后者会被忽略；到公网 `https://` 地址本来就允许，不需要例外）、`NSLocalNetworkUsageDescription`、`NSBonjourServices = _aistatus._tcp`、`WKApplication`、`WKWatchOnly`。
 - 守护进程 API **无需改动**，阶段一的 `/sessions`、`/events`、`/sessions/:id/dismiss`、`/health` 和 Bearer token 已够用。
 
 ### 目录
@@ -406,7 +496,7 @@ xcodebuild -project AIStatus.xcodeproj -scheme AIStatus -destination 'generic/pl
                                          #   AISTATUS_DEFAULT_HOST = <scutil --get LocalHostName>.local
    open AIStatus.xcodeproj
    ```
-   可选：`./scripts/generate.sh --team ABCDE12345 --host my-mac.local --prefix com.yourname`。项目改动只改 `project.yml`，然后重新运行 `generate.sh`（`.xcodeproj` 不入库）。
+   可选：`./scripts/generate.sh --team ABCDE12345 --host my-mac.local --prefix com.yourname`；公网地址和 token：`--host https://mac.tailnet.ts.net --token <aistatus token --read 的输出>`（`--token ""` 删除）。没给的选项保留 `Local.xcconfig` 里原来的值。xcconfig 里 `//` 是注释，所以脚本把每个 `/` 写成 `/$()`（`https:/$()/$()host`，Xcode 展开后就是 `https://host`）；`Local.xcconfig` 权限 600、不入库，脚本输出里不显示 token。项目改动只改 `project.yml`，然后重新运行 `generate.sh`（`.xcodeproj` 不入库）。
 4. **签名**：选中 `AIStatus` 目标 → Signing & Capabilities → Team 选你的 Personal Team；`AIStatusWidget` 目标同样操作。若提示包名被占用，用 `--prefix` 换一个前缀重新生成。为了避免每次重新生成都要再选团队，把团队 ID（在 Xcode 选好团队后，Build Settings 里 `DEVELOPMENT_TEAM` 的值）写进去：`./scripts/generate.sh --team <ID>`。
 5. **先在模拟器跑一次**（可选但推荐）：Scheme 选 `AIStatus`，目标选任意 Apple Watch 模拟器，⌘R。模拟器和 Mac 同机，主机填 `localhost` 或 `127.0.0.1` 即可验证界面和网络。
 6. **手表开发者模式**：iPhone 用线连 Mac 并“信任此电脑”；在 Xcode → Window → Devices and Simulators 里能看到配对的手表（首次会花较久“准备设备/拷贝符号”，手表要充电、解锁、靠近 iPhone）。在 iPhone 设置 → 隐私与安全性 → 开发者模式 打开并重启；手表上 设置 → 隐私与安全性 → 开发者模式 打开并重启，按提示确认。
@@ -431,9 +521,9 @@ xcodebuild -project AIStatus.xcodeproj -scheme AIStatus -destination 'generic/pl
 ### 已知限制
 
 - 只在前台联网：手放下、应用进入后台后不再更新；小组件/复杂功能只显示上次打开应用时的计数；没有通知推送（阶段三）。
-- ATS 只放开本地网络：`xxx.local`、不带点的名字、IP 可以；`mac.lan`、`*.home.arpa` 这类 DNS 名会被拦截，请用 `.local` 名或 IP。若 `.local` 在手表上解析不了，改用 Mac 的局域网 IP（建议在路由器里给 Mac 固定 IP）。
+- ATS 只放开本地网络的明文 HTTP：`xxx.local`、不带点的名字、IP 可以；`mac.lan`、`*.home.arpa` 这类 DNS 名的 `http://` 会被拦截，请用 `.local` 名或 IP（`https://` 地址不受影响）。若 `.local` 在手表上解析不了，改用 Mac 的局域网 IP（建议在路由器里给 Mac 固定 IP）。
 - 免费 Personal Team 的描述文件 7 天过期，过期后需要从 Xcode 重新安装。
-- token 存在 UserDefaults（`@AppStorage` 要求），不在钥匙串；HTTP 明文，仅适合可信局域网。
+- token 存在 UserDefaults（`@AppStorage` 要求），不在钥匙串；用 `--token` 编进应用时它以明文写在应用包的 Info.plist 里（只装在你自己的手表上，但任何拿到这个 .app 的人都能读到，不要分发构建产物）。局域网 `http://` 是明文，仅适合可信局域网；公网请用 `https://` 地址。
 - 手表排序（按开始时间、位置固定）与服务器 `/sessions` 的排序不同，是有意的；“第一次出现时的开始时间”只记在内存里，应用重启后按当时的开始时间重排。
 - 超过 4 个会话时只显示最早开始的 4 个，其余只计入 “+N”，在手表上看不到也删不了（删掉前面的才会补上来；也可以用 `aistatus dismiss`）。
 - 时钟校正精度约等于局域网单程延迟（毫秒级），对秒级计时足够。

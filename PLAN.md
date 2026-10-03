@@ -1,7 +1,7 @@
 # ai_status：手表上查看 Claude Code / Codex 多会话状态
 
 ## 目标
-办公时多项目并行，抬腕就能看到每个 AI 会话的状态。本地局域网使用即可，不做远程，不做完成百分比。
+办公时多项目并行，抬腕就能看到每个 AI 会话的状态。默认在本地局域网使用；网络禁止设备互访时可经 Tailscale Funnel 的公网 HTTPS 地址访问（见 README “公网地址”）。不做完成百分比。
 
 ## 核心体验
 - 用途：抬腕数一数完成了几个任务，不需要知道每个任务是什么。
@@ -38,6 +38,12 @@
 4. **后台刷新**（阶段四）
    - iPhone 伴侣应用 + 实时活动，自动出现在手表智能叠放。
    - 传输二选一：蓝牙（免服务器，仅近场）或从 Mac 直接发苹果推送（需付费开发者账号）。
+5. **公网地址**（分支 `public-endpoint`，接在阶段三之后）
+   - 学校 Wi-Fi 禁止设备互访，改用 Tailscale Funnel 把守护进程放到固定的公网 HTTPS 地址（`https://danielmacbook-air.tail66228a.ts.net`），Funnel 由用户自己开：`tailscale funnel --bg 7779`。
+   - 守护进程新增**公网监听端口** `publicPort`（默认 7779，只绑 127.0.0.1，没有 token 不启动）：不按来源地址信任，所有接口都要 Bearer token（`?token=` 不接受），读取/dismiss 用 `token`，钩子用 `hookToken`（没有则 `token`）；未认证的 `/health` 只回 `{"ok":true}`；不提供 `/setup`；钩子一律算远程；请求体 1 MiB、SSE 8 个、错误 token 限流、日志不含 token。`7778` 行为不变。
+   - CLI：`token --read` / `--new --shared`、`public-url`、`public-status`、`remote-setup` 打印 `-BaseUrl` 安装命令。
+   - 手表：主机可填 `https://…`（默认 443），所有请求带 token；`generate.sh --host <url> --token <token>` 编进 Info.plist，手表上不用输入。
+   - Windows：配置文件加 `url`，转发脚本走 HTTPS（显式 TLS 1.2）；钩子命令和 `hooks.json` 条目不变，不需要重新信任。
 
 ## 状态机
 | 事件 | 结果 |
@@ -57,6 +63,7 @@
 - 阶段二 ✅ 已上真机（Apple Watch SE 3，watchOS 26.6）：`watch/` 下的 watchOS 应用 + 小组件。第一版（列表 + 点开详情卡片）试用后觉得太复杂，改为单屏色块设计（分支 `watch-tiles`，已合并）。
   - 色块第二版（分支 `watch-tiles-v2`，2026-10-03）：按开始时间固定位置（去掉“等待优先”的重要度排序）；色块只显示工具图标 + 名称和 `run/ask/done · 计时`；深色调配色；点按任意色块看详情；左滑露出垃圾桶删除（任何状态，唯一删除方式），去掉点按清除/再点一次。macOS 上 `watch/scripts/check.sh` 451 项通过，40/44 mm 预览图已更新，签名真机构建成功（未安装）。**待真机确认**：田字格窄色块里的左滑与点按/长按是否冲突、触感、常亮显示和安全区、图标在手表上的清晰度。
 - 阶段三 ✅ 已实测（2026-10-03）：Windows 上的 Codex 桌面版通过局域网把钩子事件上报到 Mac（令牌校验），手表上显示为独立一格；子代理未结束时保持 running；Mac 上 Codex 钩子已信任。
+- 公网地址 🟡 代码完成（分支 `public-endpoint`，2026-10-03）：`npm test` 93 项（新增 19）、`scripts/e2e-public.mjs` 40 项、`watch/scripts/check.sh` 509 项通过，watchOS 真机构建成功（未安装）。**待上线**：设置 token → 重启守护进程 → 用户执行 `tailscale funnel --bg 7779` → 带地址和 token 重新构建手表应用 → Windows 重新安装配置。未实测：真实 Funnel（是否带 `X-Forwarded-For`、SSE 是否缓冲）、Windows 上的 HTTPS 分支。
 - 阶段四 ⏸ 搁置：后台刷新 / 推送。改用“应用常驻前台当默认屏幕”的做法后暂不需要。
 
 ## 当前环境
