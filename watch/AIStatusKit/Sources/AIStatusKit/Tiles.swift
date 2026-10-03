@@ -4,7 +4,7 @@ import Foundation
 // The watch shows one glanceable screen that splits itself by the number of
 // sessions. Everything here is plain logic (no SwiftUI) so it can be checked
 // on a Mac: which arrangement, which cards get a tile, where each tile goes,
-// and the tap-to-clear state machine.
+// what each tile says, and the swipe-to-delete state machine.
 
 /// How the screen is cut.
 public enum TileArrangement: Equatable, Sendable {
@@ -48,16 +48,16 @@ public enum TileArrangement: Equatable, Sendable {
     public var capacity: Int { rows * columns }
 }
 
-/// The tiles to draw: the most important cards (watch order, see `WatchOrdering`)
-/// up to four, plus how many did not fit.
+/// The tiles to draw: the first four sessions in stable order (see
+/// `SessionOrder`), plus how many did not fit.
 public struct TilePlan<Item> {
     public let arrangement: TileArrangement
-    /// Most important first: top to bottom, and left to right within a grid row.
+    /// Top to bottom, and left to right within a grid row.
     public let tiles: [Item]
     /// Sessions not shown (the "+N" badge); 0 when everything fits.
     public let overflow: Int
 
-    /// `ordered` must already be in importance order (StatusModel.cards is).
+    /// `ordered` must already be in tile order (StatusModel.cards is).
     public init(ordered: [Item]) {
         arrangement = TileArrangement(tileCount: ordered.count)
         tiles = Array(ordered.prefix(TileArrangement.maxTiles))
@@ -66,10 +66,9 @@ public struct TilePlan<Item> {
 }
 
 extension TilePlan where Item == SessionCard {
-    /// Sorts with `WatchOrdering` first: waiting (longest waiting first), then
-    /// done (finished longest ago first), then running.
-    public init(cards: [SessionCard]) {
-        self.init(ordered: WatchOrdering.sorted(cards))
+    /// Orders with `order` first (by default: start time, oldest first).
+    public init(cards: [SessionCard], order: SessionOrder = SessionOrder()) {
+        self.init(ordered: order.sorted(cards))
     }
 }
 
@@ -141,81 +140,187 @@ public enum TileGeometry {
     }
 }
 
-extension CardPresentation {
-    /// Finished (including interrupted / failed): the only tiles a tap can clear.
-    public var isFinished: Bool { tone == .done || tone == .failed }
+/// What a tile says on its second line: a status word and a counting timer,
+/// `run · 12:34` / `ask · 0:41` / `done · 3:02` (`run 12:34` when compact).
+public enum TileLabel {
+    /// run (running), ask (waiting for approval / input), done (finished,
+    /// interrupted or failed).
+    public static func word(_ tone: CardPresentation.Tone) -> String {
+        switch tone {
+        case .running: return "run"
+        case .waiting: return "ask"
+        case .done, .failed: return "done"
+        case .unknown: return "?"
+        }
+    }
+
+    /// Full second line for `elapsed` seconds since `timerStart`. `compact` drops
+    /// the dot (2×2 grid); `coarse` uses whole minutes (Always-On).
+    public static func status(_ tone: CardPresentation.Tone, elapsed: TimeInterval?, compact: Bool = false, coarse: Bool = false) -> String {
+        let w = word(tone)
+        guard let elapsed else { return w }
+        let time = coarse ? CoarseDuration.format(elapsed) : ElapsedClock.format(elapsed)
+        return w + (compact ? " " : " · ") + time
+    }
 }
 
-/// Tap-to-clear on the tiles (there is no detail screen):
-/// - running / waiting tiles ignore taps;
-/// - a finished tile with `dismissPolicy == .swipe` (short task) clears on the first tap;
-/// - a finished tile with `.confirm` (long task) is "armed" by the first tap and
-///   shows "tap again"; a second tap within `timeout` clears it, otherwise it
-///   reverts. Arming another tile disarms the previous one.
-public struct TapToClear: Equatable, Sendable {
-    public static let defaultTimeout: TimeInterval = 3
+/// Stopwatch text, like SwiftUI's `.timer` style: 0:41 · 12:34 · 1:05:12, and
+/// 1d 2h past a day (a seconds clock that long is noise).
+public enum ElapsedClock {
+    public static func format(_ seconds: TimeInterval) -> String {
+        let s = max(0, Int(seconds.rounded(.down)))
+        let h = s / 3600, m = (s % 3600) / 60, sec = s % 60
+        if h >= 24 { return "\(h / 24)d \(h % 24)h" }
+        if h > 0 { return "\(h):\(pad(m)):\(pad(sec))" }
+        return "\(m):\(pad(sec))"
+    }
 
-    public enum Outcome: Equatable, Sendable {
-        /// Nothing happens (running / waiting tile).
+    private static func pad(_ v: Int) -> String { v < 10 ? "0\(v)" : "\(v)" }
+}
+
+/// Swipe left on a tile to reveal a trash button on its right; tap the trash to
+/// delete the session. The only way to delete from the watch.
+/// - One tile open at a time: dragging another tile closes the open one.
+/// - Swiping right, tapping anywhere else, or `timeout` seconds without touching
+///   it closes the open tile. A tap that closes a tile does nothing else.
+/// - Tapping a tile while nothing is open asks for its detail screen.
+/// Also tracks the live drag so the tile offset can be computed (and checked)
+/// without SwiftUI.
+public struct SwipeReveal: Equatable, Sendable {
+    public static let defaultTimeout: TimeInterval = 4
+
+    public enum TapOutcome: Equatable, Sendable {
+        /// Show this session's detail screen.
+        case showDetail(String)
+        /// The tap only closed the open tile.
+        case closed
+        /// Delete this session now (optimistic dismiss).
+        case delete(String)
+        /// Nothing to do (e.g. a stale trash tap after the tile closed).
         case ignored
-        /// Call the dismiss API for this id now.
-        case clear(String)
-        /// Show "tap again" on this tile until `timeout` passes.
-        case armed(String)
     }
 
     public let timeout: TimeInterval
-    public private(set) var armedID: String?
-    public private(set) var armedAt: Date?
+    /// The tile showing its trash button.
+    public private(set) var openID: String?
+    /// When it opened (closes `timeout` after).
+    public private(set) var openedAt: Date?
+    /// Tile under the finger and its horizontal drag so far.
+    public private(set) var dragID: String?
+    public private(set) var dragX: CGFloat = 0
+    /// When the last drag ended: a tap reported for the same touch is ignored.
+    public private(set) var dragEndedAt: Date?
+    public static let tapAfterDragGrace: TimeInterval = 0.35
 
-    public init(timeout: TimeInterval = TapToClear.defaultTimeout) {
+    public init(timeout: TimeInterval = SwipeReveal.defaultTimeout) {
         self.timeout = timeout
     }
 
-    public mutating func tap(_ tile: CardPresentation, now: Date) -> Outcome {
-        guard tile.isFinished else { return .ignored }
-        if tile.dismissPolicy == .swipe {
-            if armedID == tile.id { disarm() }
-            return .clear(tile.id)
-        }
-        if isArmed(tile.id, now: now) {
-            disarm()
-            return .clear(tile.id)
-        }
-        armedID = tile.id
-        armedAt = now
-        return .armed(tile.id)
+    /// Width of the trash button for a tile of `tileWidth` points: half a narrow
+    /// grid tile, at most 60 pt on a full-width tile.
+    public static func revealWidth(tileWidth: CGFloat) -> CGFloat {
+        max(0, min(60, (tileWidth * 0.5).rounded()))
     }
 
-    public func isArmed(_ id: String, now: Date) -> Bool {
-        guard armedID == id, let armedAt else { return false }
-        return now.timeIntervalSince(armedAt) < timeout
+    /// How far past fully open the tile may be pulled while dragging.
+    public static let overshoot: CGFloat = 10
+
+    /// Finger moved. Mostly vertical movement before a drag has begun is not a
+    /// swipe and is ignored. Starting to drag a tile closes any other open tile.
+    public mutating func dragChanged(_ id: String, dx: CGFloat, dy: CGFloat) {
+        if dragID != id {
+            guard abs(dx) > abs(dy) else { return }
+            if let open = openID, open != id { close() }
+            dragID = id
+        }
+        dragX = dx
     }
 
-    /// When the armed tile should revert, if any.
-    public var expiresAt: Date? { armedAt?.addingTimeInterval(timeout) }
+    /// Finger lifted. Opens when the tile would come to rest (using the predicted
+    /// end of a flick) more than half-way open; otherwise closes. Returns whether
+    /// the tile is now open.
+    @discardableResult
+    public mutating func dragEnded(_ id: String, predictedDX: CGFloat, revealWidth: CGFloat, now: Date) -> Bool {
+        guard dragID == id else { return openID == id }
+        let base: CGFloat = openID == id ? -revealWidth : 0
+        dragID = nil
+        dragX = 0
+        dragEndedAt = now
+        if revealWidth > 0, base + predictedDX < -revealWidth / 2 {
+            openID = id
+            openedAt = now
+            return true
+        }
+        if openID == id { close() }
+        return false
+    }
 
-    /// Revert once the timeout has passed. Returns true if something changed.
+    /// The system cancelled the touch (no end event): snap back to the resting
+    /// position without opening or closing anything.
+    public mutating func dragCancelled(_ id: String) {
+        guard dragID == id else { return }
+        dragID = nil
+        dragX = 0
+    }
+
+    /// Horizontal offset of the tile's content (0 = closed, -revealWidth = open),
+    /// following the finger during a drag, clamped to [-(revealWidth + overshoot), 0].
+    public func offset(for id: String, revealWidth: CGFloat) -> CGFloat {
+        let base: CGFloat = openID == id ? -revealWidth : 0
+        guard dragID == id else { return base }
+        return min(0, max(-(revealWidth + Self.overshoot), base + dragX))
+    }
+
+    public func isOpen(_ id: String) -> Bool { openID == id }
+
+    /// Tap on a tile's body. Ignored while dragging or right after a drag (the
+    /// same touch), so a swipe never also opens the detail screen.
+    public mutating func tapTile(_ id: String, now: Date) -> TapOutcome {
+        if dragID != nil { return .ignored }
+        if let end = dragEndedAt, now.timeIntervalSince(end) < Self.tapAfterDragGrace { return .ignored }
+        if openID != nil {
+            close()
+            return .closed
+        }
+        return .showDetail(id)
+    }
+
+    /// Tap on the trash button of `id`.
+    public mutating func tapTrash(_ id: String) -> TapOutcome {
+        guard openID == id else { return .ignored }
+        close()
+        return .delete(id)
+    }
+
+    /// Tap on the background / long press: close whatever is open.
+    @discardableResult
+    public mutating func close() -> Bool {
+        let changed = openID != nil
+        openID = nil
+        openedAt = nil
+        return changed
+    }
+
+    /// When the open tile closes by itself, if any.
+    public var expiresAt: Date? { openedAt?.addingTimeInterval(timeout) }
+
+    /// Close once `timeout` has passed (not while the finger is on it).
     @discardableResult
     public mutating func expire(now: Date) -> Bool {
-        guard let id = armedID, !isArmed(id, now: now) else { return false }
-        disarm()
-        return true
+        guard let openedAt, dragID != openID, now.timeIntervalSince(openedAt) >= timeout else { return false }
+        return close()
     }
 
-    /// Drop the armed state when that tile is gone or no longer finished
-    /// (cleared elsewhere, or a new prompt started it again).
+    /// Forget tiles that are no longer on screen (deleted elsewhere, pushed past
+    /// the first four).
     @discardableResult
-    public mutating func reconcile(with tiles: [CardPresentation]) -> Bool {
-        guard let id = armedID else { return false }
-        if tiles.contains(where: { $0.id == id && $0.isFinished }) { return false }
-        disarm()
-        return true
-    }
-
-    public mutating func disarm() {
-        armedID = nil
-        armedAt = nil
+    public mutating func reconcile(visible ids: [String]) -> Bool {
+        if let d = dragID, !ids.contains(d) {
+            dragID = nil
+            dragX = 0
+        }
+        guard let open = openID, !ids.contains(open) else { return false }
+        return close()
     }
 }
 

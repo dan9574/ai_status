@@ -2,50 +2,87 @@ import AIStatusKit
 import SwiftUI
 
 /// The main screen: up to four session tiles filling the display edge to edge
-/// (see `TileArrangement`). Owns the tap-to-clear state; everything it draws
-/// comes from `TileBoard`, which is pure and can be rendered off-screen.
+/// (see `TileArrangement`), in stable start order. Owns the swipe-to-delete
+/// state and the detail sheet; everything it draws comes from `TileBoard`,
+/// which is pure and can be rendered off-screen.
 struct TileBoardView: View {
     @ObservedObject var model: StatusModel
     let openSettings: () -> Void
-    @State private var taps = TapToClear()
+    @State private var swipe = SwipeReveal()
+    @State private var detail: DetailTarget?
 
     var body: some View {
-        let items = model.presentations
         // Outer reader: the safe area (the system clock sits above it).
         // Inner reader: the whole display, so tile colour reaches every edge.
         GeometryReader { outer in
             let insets = TileInsets(outer.safeAreaInsets)
             GeometryReader { full in
                 TileBoard(
-                    items: items, size: full.size, insets: insets, connection: model.connection,
-                    armedID: taps.armedID, onTap: handleTap, onLongPress: openSettings
+                    items: model.presentations, size: full.size, insets: insets,
+                    connection: model.connection, swipe: swipe, actions: actions
                 )
             }
             .ignoresSafeArea()
         }
-        .task(id: taps.armedAt) {
-            // Revert "tap again" after the timeout.
-            guard let deadline = taps.expiresAt else { return }
+        .task(id: swipe.openedAt) {
+            // Close the open tile after a few seconds without touching it.
+            guard let deadline = swipe.expiresAt else { return }
             let wait = deadline.timeIntervalSinceNow
             if wait > 0 { try? await Task.sleep(nanoseconds: UInt64(wait * 1_000_000_000)) }
             guard !Task.isCancelled else { return }
-            withAnimation(.easeOut(duration: 0.2)) { _ = taps.expire(now: Date()) }
+            withAnimation(.snappy(duration: 0.25)) { _ = swipe.expire(now: Date()) }
         }
-        .onChange(of: model.cards) { _, _ in
-            taps.reconcile(with: model.presentations)
+        .onChange(of: model.cards) { _, cards in
+            swipe.reconcile(visible: TilePlan(ordered: cards).tiles.map(\.id))
+        }
+        .sheet(item: $detail) { target in
+            SessionDetailSheet(model: model, target: target)
         }
     }
 
-    private func handleTap(_ p: CardPresentation) {
-        switch taps.tap(p, now: Date()) {
-        case .ignored:
-            break
-        case .armed:
-            Haptics.armed()
-        case .clear(let id):
-            // StatusModel hides the card at once and restores it if the POST fails.
-            Task { await model.dismiss(id: id) }
-        }
+    /// StatusModel hides the card at once and restores it if the POST fails;
+    /// the board animates the re-split.
+    private func delete(_ id: String) {
+        Task { await model.dismiss(id: id) }
+    }
+
+    private var actions: TileActions {
+        TileActions(
+            tapTile: { id in
+                var outcome = SwipeReveal.TapOutcome.ignored
+                withAnimation(.snappy(duration: 0.25)) { outcome = swipe.tapTile(id, now: Date()) }
+                if case .showDetail(let id) = outcome, let p = model.presentations.first(where: { $0.id == id }) {
+                    detail = DetailTarget(p)
+                }
+            },
+            tapTrash: { id in
+                if case .delete(let id) = swipe.tapTrash(id) { delete(id) }
+            },
+            delete: delete,
+            dragChanged: { id, t in swipe.dragChanged(id, dx: t.width, dy: t.height) },
+            dragEnded: { id, predicted, reveal in
+                withAnimation(.snappy(duration: 0.25)) {
+                    _ = swipe.dragEnded(id, predictedDX: predicted, revealWidth: reveal, now: Date())
+                }
+            },
+            dragCancelled: { id in withAnimation(.snappy(duration: 0.25)) { swipe.dragCancelled(id) } },
+            tapBackground: { withAnimation(.snappy(duration: 0.25)) { _ = swipe.close() } },
+            longPress: {
+                swipe.close()
+                openSettings()
+            }
+        )
+    }
+}
+
+/// The session whose detail sheet is open (captured so the sheet can still show
+/// it if the session disappears meanwhile).
+struct DetailTarget: Identifiable {
+    let id: String
+    let snapshot: CardPresentation
+    init(_ p: CardPresentation) {
+        id = p.id
+        snapshot = p
     }
 }
 
@@ -55,15 +92,28 @@ extension TileInsets {
     }
 }
 
+/// What the tiles report back to `TileBoardView`.
+struct TileActions {
+    var tapTile: (String) -> Void = { _ in }
+    var tapTrash: (String) -> Void = { _ in }
+    /// Delete without the swipe (VoiceOver action).
+    var delete: (String) -> Void = { _ in }
+    var dragChanged: (String, CGSize) -> Void = { _, _ in }
+    /// id, predicted end translation (x), trash button width.
+    var dragEnded: (String, CGFloat, CGFloat) -> Void = { _, _, _ in }
+    var dragCancelled: (String) -> Void = { _ in }
+    var tapBackground: () -> Void = {}
+    var longPress: () -> Void = {}
+}
+
 /// Pure drawing of the tile screen for a given display size and safe-area insets.
 struct TileBoard: View {
     let items: [CardPresentation]
     let size: CGSize
     var insets: TileInsets = .zero
     var connection: ConnectionState = .live
-    var armedID: String?
-    var onTap: (CardPresentation) -> Void = { _ in }
-    var onLongPress: () -> Void = {}
+    var swipe = SwipeReveal()
+    var actions = TileActions()
 
     var body: some View {
         let plan = TilePlan(ordered: items)
@@ -71,23 +121,20 @@ struct TileBoard: View {
         let metrics = TileMetrics(arrangement: plan.arrangement, screenWidth: size.width)
         ZStack(alignment: .topLeading) {
             Color.black
-                .onLongPressGesture(perform: onLongPress)
+                .contentShape(Rectangle())
+                .onTapGesture(perform: actions.tapBackground)
+                .onLongPressGesture(minimumDuration: 0.5, perform: actions.longPress)
             ForEach(Array(zip(plan.tiles, slots)), id: \.0.id) { p, slot in
-                SessionTile(p: p, slot: slot, metrics: metrics, armed: p.id == armedID)
+                SessionTile(p: p, slot: slot, metrics: metrics, swipe: swipe, actions: actions)
                     .frame(width: slot.frame.width, height: slot.frame.height)
                     .offset(x: slot.frame.minX, y: slot.frame.minY)
-                    .gesture(
-                        LongPressGesture(minimumDuration: 0.5)
-                            .onEnded { _ in onLongPress() }
-                            .exclusively(before: TapGesture().onEnded { onTap(p) })
-                    )
                     .transition(.opacity)
             }
             StatusStrip(connection: connection, overflow: plan.overflow, insets: insets, scale: metrics.scale)
         }
         .frame(width: size.width, height: size.height, alignment: .topLeading)
         .animation(.easeOut(duration: 0.25), value: plan.tiles.map(\.id))
-        .accessibilityAction(named: "Settings", onLongPress)
+        .accessibilityAction(named: "Settings", actions.longPress)
     }
 }
 
@@ -95,124 +142,168 @@ struct TileBoard: View {
 /// scaled with the screen width. Fixed sizes rather than text styles: this is a
 /// glance screen and every tile must look the same.
 struct TileMetrics {
-    var name: CGFloat
-    var timer: CGFloat
-    var marker: CGFloat
-    var nameLines: Int
-    /// Grid tiles are too narrow for the marker beside a two-line name: it moves
-    /// in front of the timer instead.
-    var markerOnTimerLine: Bool
+    /// Tool name (line 1); the glyph is drawn at about this size.
+    var tool: CGFloat
+    /// Status word + timer (line 2).
+    var status: CGFloat
     var spacing: CGFloat
     var padding: CGFloat
+    /// 2×2 grid: `run 12:34` without the dot.
+    var compact: Bool
     var scale: CGFloat
 
     init(arrangement: TileArrangement, screenWidth: CGFloat) {
         let k = max(0.8, min(1.4, screenWidth / 162))
         scale = k
-        markerOnTimerLine = false
+        compact = false
         switch arrangement {
         case .empty, .single:
-            name = 28; timer = 46; marker = 16; nameLines = 2; spacing = 6; padding = 10
+            tool = 21; status = 27; spacing = 8; padding = 8
         case .rows(2):
-            name = 21; timer = 30; marker = 12; nameLines = 1; spacing = 1; padding = 10
+            tool = 18; status = 24; spacing = 5; padding = 8
         case .rows:
-            name = 17; timer = 22; marker = 10; nameLines = 1; spacing = 0; padding = 10
+            tool = 15; status = 19; spacing = 2; padding = 8
         case .grid:
-            name = 15; timer = 21; marker = 9; nameLines = 2; spacing = 1; padding = 4
-            markerOnTimerLine = true
+            tool = 14; status = 16; spacing = 4; padding = 3
+            compact = true
         }
-        name *= k; timer *= k; marker *= k; spacing *= k; padding *= k
+        tool *= k; status *= k; spacing *= k; padding *= k
     }
 }
 
-/// One session: tool marker + project name + one self-running timer.
+/// One session: tool mark + tool name, then status word + counting timer.
+/// Swiping left slides it over a red trash button.
 struct SessionTile: View {
     let p: CardPresentation
     let slot: TileSlot
     let metrics: TileMetrics
-    let armed: Bool
+    let swipe: SwipeReveal
+    let actions: TileActions
     @Environment(\.isLuminanceReduced) private var dimmed
+    @GestureState private var touching = false
 
     var body: some View {
-        let style = armed ? TileStyle.armed(dimmed: dimmed) : TileStyle.of(p.tone, dimmed: dimmed)
+        let style = TileStyle.of(p.tone, dimmed: dimmed)
+        let reveal = SwipeReveal.revealWidth(tileWidth: slot.frame.width)
+        let x = swipe.offset(for: p.id, revealWidth: reveal)
+        ZStack(alignment: .topLeading) {
+            if x < 0 { trash(width: reveal) }
+            body(style)
+                .offset(x: x)
+                .gesture(LongPressGesture(minimumDuration: 0.5)
+                    .onEnded { _ in actions.longPress() }
+                    .exclusively(before: TapGesture().onEnded { actions.tapTile(p.id) }))
+                .simultaneousGesture(drag(reveal: reveal))
+        }
+        .frame(width: slot.frame.width, height: slot.frame.height, alignment: .topLeading)
+        .clipped()
+        .onChange(of: touching) { _, now in
+            // Also fires after a normal end; deferred so `onEnded` always runs first.
+            if !now { DispatchQueue.main.async { actions.dragCancelled(p.id) } }
+        }
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel("\(p.tool.displayName), \(p.headline)")
+        .accessibilityValue(timerAccessibilityValue)
+        .accessibilityAddTraits(.isButton)
+        .accessibilityHint("Shows details. Swipe left to delete.")
+        .accessibilityAction { actions.tapTile(p.id) }
+        .accessibilityAction(named: "Delete") { actions.delete(p.id) }
+    }
+
+    private func drag(reveal: CGFloat) -> some Gesture {
+        DragGesture(minimumDistance: 8)
+            .updating($touching) { _, state, _ in state = true }
+            .onChanged { v in actions.dragChanged(p.id, v.translation) }
+            .onEnded { v in actions.dragEnded(p.id, v.predictedEndTranslation.width, reveal) }
+    }
+
+    private func body(_ style: TileStyle) -> some View {
         ZStack(alignment: .topLeading) {
             Rectangle().fill(style.fill)
-            content(style)
+            content
                 .frame(width: slot.content.width, height: slot.content.height)
                 .offset(x: slot.content.minX - slot.frame.minX, y: slot.content.minY - slot.frame.minY)
         }
-        .contentShape(Rectangle())
-        .accessibilityElement(children: .ignore)
-        .accessibilityLabel("\(p.project), \(p.tool.displayName), \(p.headline)")
-        .accessibilityValue(timerAccessibilityValue)
-        .accessibilityHint(hint)
-        .accessibilityAddTraits(p.isFinished ? .isButton : [])
-    }
-
-    private func marker(_ style: TileStyle) -> some View {
-        Image(systemName: p.tool.tileSymbol)
-            .font(.system(size: metrics.marker, weight: .heavy))
-            .foregroundStyle(style.secondary)
-    }
-
-    private func content(_ style: TileStyle) -> some View {
-        VStack(spacing: metrics.spacing) {
-            HStack(alignment: .firstTextBaseline, spacing: 3 * metrics.scale) {
-                if !metrics.markerOnTimerLine { marker(style) }
-                Text(p.project)
-                    .font(.system(size: metrics.name, weight: .bold, design: .rounded))
-                    .lineLimit(metrics.nameLines)
-                    .minimumScaleFactor(0.7)
-                    .multilineTextAlignment(.center)
-            }
-            if armed {
-                Label("Tap again", systemImage: "xmark")
-                    .font(.system(size: metrics.timer * 0.62, weight: .bold, design: .rounded))
-                    .lineLimit(1)
-                    .minimumScaleFactor(0.5)
-            } else if let start = p.timerStart {
-                HStack(alignment: .firstTextBaseline, spacing: 3 * metrics.scale) {
-                    if metrics.markerOnTimerLine { marker(style) }
-                    TileTimer(start: start)
-                        .font(.system(size: metrics.timer, weight: .semibold, design: .rounded))
-                        .monospacedDigit()
-                }
-                .lineLimit(1)
-                .minimumScaleFactor(0.5)
-            } else if metrics.markerOnTimerLine {
-                marker(style)
-            }
-        }
         .foregroundStyle(style.text)
+        .frame(width: slot.frame.width, height: slot.frame.height, alignment: .topLeading)
+        .contentShape(Rectangle())
+    }
+
+    private var content: some View {
+        VStack(spacing: metrics.spacing) {
+            HStack(spacing: metrics.tool * 0.3) {
+                ToolGlyph(tool: p.tool, size: metrics.tool * 0.95)
+                Text(p.tool.displayName)
+                    .font(.system(size: metrics.tool, weight: .semibold, design: .rounded))
+            }
+            .lineLimit(1)
+            .minimumScaleFactor(0.6)
+            TileStatusText(tone: p.tone, start: p.timerStart, compact: metrics.compact)
+                .font(.system(size: metrics.status, weight: .semibold, design: .rounded))
+                .monospacedDigit()
+                .lineLimit(1)
+                .minimumScaleFactor(0.55)
+        }
         .padding(.horizontal, metrics.padding)
         .frame(maxWidth: .infinity, maxHeight: .infinity)
     }
 
-    private var timerAccessibilityValue: Text {
-        guard let start = p.timerStart else { return Text("") }
-        return Text("\(p.timerLabel ?? "") \(Text(start, style: .relative))")
+    /// Red button under the right edge of the tile, revealed as the tile slides
+    /// left. A 2 pt black gap keeps the tile edge visible; the icon is centred in
+    /// the tile's text area (top tiles reach under the clock).
+    private func trash(width: CGFloat) -> some View {
+        let gap = TileGeometry.gap
+        let w = max(0, width - gap)
+        let iconY = slot.content.midY - slot.frame.minY
+        return Button { actions.tapTrash(p.id) } label: {
+            ZStack(alignment: .topLeading) {
+                Rectangle().fill(TileStyle.trashFill)
+                Image(systemName: "trash.fill")
+                    .font(.system(size: min(22, max(15, w * 0.42)), weight: .semibold))
+                    .foregroundStyle(TileStyle.trashIcon)
+                    .frame(width: w)
+                    .position(x: w / 2, y: iconY)
+            }
+            .frame(width: w + SwipeReveal.overshoot, height: slot.frame.height)
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .frame(width: w + SwipeReveal.overshoot, height: slot.frame.height, alignment: .topLeading)
+        .offset(x: slot.frame.width - w)
+        .allowsHitTesting(swipe.isOpen(p.id))
+        .accessibilityLabel("Delete")
     }
 
-    private var hint: String {
-        guard p.isFinished else { return "" }
-        if armed { return "Tap again to clear" }
-        return p.dismissPolicy == .swipe ? "Tap to clear" : "Tap twice to clear"
+    private var timerAccessibilityValue: Text {
+        guard let start = p.timerStart else { return Text("") }
+        return Text(start, style: .relative)
     }
 }
 
-/// Counts up from `start` by itself (no polling). In Always-On the screen only
-/// refreshes about once a minute, so show whole minutes instead of frozen seconds.
-struct TileTimer: View {
-    let start: Date
+/// Second line of a tile: `run · 12:34` counting up from `start` by itself.
+/// In Always-On the screen only refreshes about once a minute, so it shows
+/// whole minutes (`run · 12m`) instead of frozen seconds.
+struct TileStatusText: View {
+    let tone: CardPresentation.Tone
+    let start: Date?
+    var compact = false
     @Environment(\.isLuminanceReduced) private var dimmed
 
     var body: some View {
-        if dimmed {
-            TimelineView(.everyMinute) { context in
-                Text(CoarseDuration.format(context.date.timeIntervalSince(start)))
+        if let start {
+            if dimmed {
+                TimelineView(.everyMinute) { context in
+                    Text(TileLabel.status(tone, elapsed: context.date.timeIntervalSince(start), compact: compact, coarse: true))
+                }
+            } else {
+                // Tick on the start's whole seconds, so the clock turns over on time.
+                let next = start.addingTimeInterval(max(0, Date().timeIntervalSince(start)).rounded(.up))
+                TimelineView(.periodic(from: next, by: 1)) { context in
+                    Text(TileLabel.status(tone, elapsed: context.date.timeIntervalSince(start), compact: compact))
+                }
             }
         } else {
-            Text(start, style: .timer)
+            Text(TileLabel.word(tone))
         }
     }
 }

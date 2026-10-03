@@ -1,7 +1,8 @@
 import AIStatusKit
 import SwiftUI
 
-/// The whole app UI: one screen of session tiles (no navigation, no scrolling).
+/// The whole app UI: one screen of session tiles (no navigation, no scrolling;
+/// tapping a tile opens a one-screen detail sheet).
 /// The watch app's `@main` just hosts this view; scene-phase driven networking,
 /// haptics and the widget hand-off live here so they can be type-checked on macOS.
 /// Settings open as a sheet on a long press anywhere, or from the empty /

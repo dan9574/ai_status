@@ -1,47 +1,54 @@
 import Foundation
 
-/// Watch ordering: waiting first (longest-waiting first), then done (oldest
-/// finished first, i.e. the one idling longest), then running (longest-running
-/// first), anything unknown last. Ties fall back to start time, then id, so the
-/// order is total and stable across snapshots.
+/// Stable tile order: every session keeps its place on the watch while it is
+/// visible, so a glance can count finished tiles without tracking moves.
 ///
-/// Note this intentionally differs from the daemon's own order
-/// (waiting → running → done): on the wrist, finished work needs action, running
-/// work does not.
-public enum WatchOrdering {
-    public static func rank(_ s: SessionStatus) -> Int {
-        switch s {
-        case .waiting: return 0
-        case .done: return 1
-        case .running: return 2
-        case .other: return 3
-        }
+/// Sessions are ordered by when they started (oldest first, ties by id). The
+/// daemon only reports the start of the *current* run (`startedAt` moves when a
+/// new prompt starts), so the first start time seen for an id is remembered and
+/// used for as long as the session stays on the daemon's list; a status change
+/// or a new run never moves a tile. A session that disappears (cleared) and
+/// comes back later is new and goes by its new start time.
+public struct SessionOrder: Equatable, Sendable {
+    private var keys: [String: Int64] = [:]
+
+    public init() {}
+
+    /// Best known start of a session: run start, else when it started waiting /
+    /// finished / last changed; unknown sorts last.
+    public static func startKey(_ c: SessionCard) -> Int64 {
+        c.startedAt ?? c.waitingSince ?? c.finishedAt ?? c.updatedAt ?? .max
     }
 
-    static func key(_ c: SessionCard) -> Int64 {
-        switch c.status {
-        case .waiting: return c.waitingSince ?? c.startedAt ?? c.updatedAt ?? .max
-        case .done: return c.finishedAt ?? c.updatedAt ?? .max
-        case .running: return c.startedAt ?? c.updatedAt ?? .max
-        case .other: return c.updatedAt ?? .max
-        }
+    /// Remember the start of sessions seen for the first time and forget the ones
+    /// the daemon no longer reports. Pass the full server list (including cards
+    /// hidden by a pending dismiss, so a failed dismiss restores the tile in place).
+    public mutating func update(with cards: [SessionCard]) {
+        var next: [String: Int64] = [:]
+        for c in cards { next[c.id] = keys[c.id] ?? next[c.id] ?? Self.startKey(c) }
+        keys = next
     }
 
-    public static func sorted(_ cards: [SessionCard]) -> [SessionCard] {
+    public mutating func reset() {
+        keys = [:]
+    }
+
+    public func key(_ c: SessionCard) -> Int64 {
+        keys[c.id] ?? Self.startKey(c)
+    }
+
+    /// Oldest first; ties broken by id so the order is total.
+    public func sorted(_ cards: [SessionCard]) -> [SessionCard] {
         cards.sorted { a, b in
-            let ra = rank(a.status), rb = rank(b.status)
-            if ra != rb { return ra < rb }
             let ka = key(a), kb = key(b)
             if ka != kb { return ka < kb }
-            let sa = a.startedAt ?? .max, sb = b.startedAt ?? .max
-            if sa != sb { return sa < sb }
             return a.id < b.id
         }
     }
 }
 
-/// Everything a card view needs, with server timestamps already converted to
-/// local `Date`s. Views render the dates with `Text(date, style: .timer)`, so
+/// Everything a tile or the detail screen needs, with server timestamps already
+/// converted to local `Date`s. Views count up from `timerStart` themselves, so
 /// nothing has to poll to keep the clocks moving.
 public struct CardPresentation: Identifiable, Hashable, Sendable {
     public enum Tone: Hashable, Sendable { case running, waiting, done, failed, unknown }
@@ -50,16 +57,14 @@ public struct CardPresentation: Identifiable, Hashable, Sendable {
     public var tool: AgentTool
     public var project: String
     public var tone: Tone
-    /// "Running", "Needs approval", "Done", "Interrupted", …
+    /// Detail screen: "Running", "Needs approval", "Done", "Interrupted", …
     public var headline: String
-    /// Label shown before the ticking timer ("for", "waiting", "idle").
-    public var timerLabel: String?
-    /// Start of the ticking timer (counts up from this local date), if any.
+    /// Start of the ticking timer: run start (running), waiting start (waiting),
+    /// finish time (done). Nil only for unknown statuses.
     public var timerStart: Date?
-    /// Static detail, e.g. "ran 4m 10s" for done cards.
+    /// Static detail for the detail screen, e.g. "ran 4m 10s" for done cards.
     public var detail: String?
     public var message: String?
-    public var dismissPolicy: DismissPolicy
     /// The start time was reconstructed by the daemon (it missed the prompt).
     public var approximate: Bool
 
@@ -67,19 +72,17 @@ public struct CardPresentation: Identifiable, Hashable, Sendable {
         id = card.id
         tool = card.tool
         project = card.displayProject
-        dismissPolicy = card.dismissPolicy
         approximate = card.startedAtApprox
         message = card.lastMessage
         detail = nil
-        timerLabel = nil
         timerStart = nil
 
         switch card.status {
         case .running:
             tone = .running
             headline = "Running"
-            timerLabel = approximate ? "for ~" : "for"
             timerStart = clock.localDate(serverMs: card.startedAt ?? card.updatedAt)
+            if approximate { detail = "start time approximate" }
         case .waiting:
             tone = .waiting
             switch card.waitingReason {
@@ -87,7 +90,6 @@ public struct CardPresentation: Identifiable, Hashable, Sendable {
             case .question?: headline = "Has a question"
             default: headline = "Needs input"
             }
-            timerLabel = "waiting"
             timerStart = clock.localDate(serverMs: card.waitingSince ?? card.startedAt ?? card.updatedAt)
             if let started = card.startedAt, let since = card.waitingSince, since >= started {
                 detail = "ran \(DurationFormat.short(ms: since - started)) before"
@@ -103,7 +105,6 @@ public struct CardPresentation: Identifiable, Hashable, Sendable {
                 tone = .done
                 headline = "Done"
             }
-            timerLabel = "idle"
             timerStart = clock.localDate(serverMs: card.finishedAt ?? card.updatedAt)
             if let ms = card.runDurationMs {
                 detail = (approximate ? "ran ~" : "ran ") + DurationFormat.short(ms: ms)

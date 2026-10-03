@@ -172,24 +172,12 @@ struct SplitMix {
 }
 
 func runOrderingAndPresentationChecks() {
-    suite("watch ordering") {
+    suite("tile order on real daemon data") {
         let mixed = try Snapshot.decode(fixture("sessions-mixed.json"))
-        let order = WatchOrdering.sorted(mixed.sessions).map(\.displayProject)
-        expectEqual(order, ["proj-wait", "proj-cxq", "beta-service", "proj-fail", "proj-cxi", "proj-quick", "proj-run", "proj-approx"],
-                    "waiting (oldest wait first), done (oldest finished first), running (oldest start first)")
-        let cards = [
-            card("claude:r2", .running, started: 50),
-            card("claude:d1", .done, started: 1, finished: 30),
-            card("claude:w1", .waiting, started: 5, waiting: 40),
-            card("claude:r1", .running, started: 10),
-            card("claude:d0", .done, started: 2, finished: 20),
-            card("claude:w0", .waiting, started: 6, waiting: 35),
-            SessionCard(id: "x:u", tool: .other("x"), sessionId: "u", status: .other("idle")),
-        ]
-        expectEqual(WatchOrdering.sorted(cards).map(\.id), ["claude:w0", "claude:w1", "claude:d0", "claude:d1", "claude:r1", "claude:r2", "x:u"], "synthetic order")
-        expectEqual(WatchOrdering.sorted(cards.reversed()).map(\.id), WatchOrdering.sorted(cards).map(\.id), "order independent of input order")
-        let tie = [card("codex:b", .done, finished: 5), card("claude:a", .done, finished: 5)]
-        expectEqual(WatchOrdering.sorted(tie).map(\.id), ["claude:a", "codex:b"], "ties broken by id")
+        let sorted = SessionOrder().sorted(mixed.sessions)
+        let keys = sorted.map(SessionOrder.startKey)
+        check(zip(keys, keys.dropFirst()).allSatisfy { $0 <= $1 }, "oldest start first: \(sorted.map(\.displayProject))")
+        expectEqual(SessionOrder().sorted(mixed.sessions.reversed()).map(\.id), sorted.map(\.id), "order independent of input order")
     }
 
     suite("clock skew") {
@@ -223,20 +211,17 @@ func runOrderingAndPresentationChecks() {
         let p = Dictionary(uniqueKeysWithValues: mixed.sessions.map { ($0.displayProject, CardPresentation(card: $0, clock: clock)) })
         let run = mixed.sessions.first { $0.project == "proj-run" }!
         expectEqual(p["proj-run"]?.headline, "Running", "running headline")
-        expectEqual(p["proj-run"]?.timerLabel, "for", "running timer label")
+        expectEqual(p["proj-run"]?.detail, nil, "running: no detail")
         let expectedStart = Date(timeIntervalSince1970: Double(run.startedAt!) / 1000 - 120)
         check(abs((p["proj-run"]?.timerStart ?? .distantPast).timeIntervalSince(expectedStart)) < 0.001, "running timer start corrected for skew")
-        expectEqual(p["proj-approx"]?.timerLabel, "for ~", "approximate start marked")
+        expectEqual(p["proj-approx"]?.detail, "start time approximate", "approximate start marked")
         expectEqual(p["proj-wait"]?.headline, "Needs approval", "permission => Needs approval")
         expectEqual(p["proj-wait"]?.tone, .waiting, "waiting tone")
-        expectEqual(p["proj-wait"]?.timerLabel, "waiting", "waiting timer label")
         expectEqual(p["beta-service"]?.headline, "Done", "done headline")
-        expectEqual(p["beta-service"]?.timerLabel, "idle", "done shows idle timer")
         expectEqual(p["beta-service"]?.detail, "ran 2s", "done shows run duration")
         expectEqual(p["proj-cxi"]?.headline, "Interrupted", "interrupted headline")
         expectEqual(p["proj-fail"]?.headline, "Failed", "error headline")
         expectEqual(p["proj-fail"]?.tone, .failed, "failed tone")
-        expectEqual(p["proj-quick"]?.dismissPolicy, .swipe, "policy carried through")
         expectEqual(p["proj-cxq"]?.tool, .codex, "tool carried through")
         let q = CardPresentation(card: SessionCard(id: "claude:q", tool: .claude, sessionId: "q", status: .waiting, startedAt: 0, waitingSince: 65_000, waitingReason: .question), clock: ClockSync())
         expectEqual(q.headline, "Has a question", "question headline")

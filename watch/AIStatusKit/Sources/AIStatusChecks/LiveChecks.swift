@@ -48,8 +48,8 @@ func runLiveChecks(host: String, port: Int, lanHost: String?, token: String?) as
         check(running?.timerStart.map { abs($0.timeIntervalSinceNow) < 5 } == true, "running timer anchored near now")
 
         try await hook(["session_id": sid, "cwd": "/tmp/live-proj", "hook_event_name": "Notification", "message": "Claude needs your permission to use Bash", "notification_type": "permission_prompt"])
-        try await waitUntil(timeout: 5) { model.cards.first?.id == cardId && model.cards.first?.status == .waiting }
-        check(true, "pushed: waiting card sorted first")
+        try await waitUntil(timeout: 5) { model.cards.contains { $0.id == cardId && $0.status == .waiting } }
+        check(true, "pushed: waiting card")
         check(transitions.contains(.becameWaiting(id: cardId)), "haptic transition: waiting")
 
         try await hook(["session_id": sid, "cwd": "/tmp/live-proj", "hook_event_name": "PostToolUse", "tool_name": "Bash"])

@@ -4,34 +4,36 @@ import SwiftUI
 /// Sample data for SwiftUI previews and the off-screen renders (watch/previews).
 public enum SampleData {
     /// Six sessions in mixed states. Taking the first n gives a mixed set for
-    /// every tile count: running, + waiting, + done (short), + running, + done (long), + running.
+    /// every tile count (tiles then sort by start time): running, + waiting,
+    /// + done, + running (oldest), + done, + running.
     public static func snapshot(count: Int = 6, now: Date = Date()) -> Snapshot {
         let t = Int64(now.timeIntervalSince1970 * 1000)
         let pool = [
             SessionCard(id: "claude:a", tool: .claude, sessionId: "a", project: "ai_status", status: .running,
                         startedAt: t - 754_000, updatedAt: t - 5_000),
             SessionCard(id: "codex:b", tool: .codex, sessionId: "b", project: "billing-service", status: .waiting,
-                        startedAt: t - 900_000, waitingSince: t - 41_000, waitingReason: .permission, updatedAt: t - 41_000),
+                        startedAt: t - 900_000, waitingSince: t - 41_000, waitingReason: .permission,
+                        lastMessage: "Run `terraform apply` on staging?", updatedAt: t - 41_000),
             SessionCard(id: "claude:d", tool: .claude, sessionId: "d", project: "dotfiles", status: .done,
-                        startedAt: t - 200_000, finishedAt: t - 182_000, runDurationMs: 18_000,
-                        dismissPolicy: .swipe, updatedAt: t - 182_000),
+                        startedAt: t - 432_000, finishedAt: t - 182_000, runDurationMs: 250_000,
+                        lastMessage: "Updated the install script and pushed the branch.", updatedAt: t - 182_000),
             SessionCard(id: "codex:i", tool: .codex, sessionId: "i", project: "infra-terraform", status: .running,
                         startedAt: t - 3_912_000, updatedAt: t - 2_000),
             SessionCard(id: "codex:p", tool: .codex, sessionId: "p", project: "photos-app", status: .done,
                         startedAt: t - 2_550_000, finishedAt: t - 1_250_000, runDurationMs: 1_300_000,
-                        dismissPolicy: .confirm, updatedAt: t - 1_250_000),
+                        updatedAt: t - 1_250_000),
             SessionCard(id: "claude:n", tool: .claude, sessionId: "n", project: "notes", status: .running,
                         startedAt: t - 95_000, updatedAt: t - 1_000),
         ]
-        return Snapshot(serverTime: t, swipeThresholdSec: 60, sessions: Array(pool.prefix(count)))
+        return Snapshot(serverTime: t, sessions: Array(pool.prefix(count)))
     }
 
-    /// The first `count` sample sessions in watch order, ready for tiles.
+    /// The first `count` sample sessions in tile order, ready for tiles.
     public static func presentations(count: Int = 6, now: Date = Date()) -> [CardPresentation] {
         let s = snapshot(count: count, now: now)
         var clock = ClockSync()
         clock.record(serverTimeMs: s.serverTime, sentAt: now, receivedAt: now)
-        return WatchOrdering.sorted(s.sessions).map { CardPresentation(card: $0, clock: clock) }
+        return SessionOrder().sorted(s.sessions).map { CardPresentation(card: $0, clock: clock) }
     }
 }
 
@@ -57,16 +59,36 @@ public struct WatchDisplay: Sendable {
 @MainActor
 public enum ScreenCatalog {
     public static func screens(on display: WatchDisplay, now: Date = Date()) -> [(name: String, view: AnyView)] {
-        func tiles(_ n: Int, connection: ConnectionState = .live, armed: String? = nil) -> AnyView {
-            AnyView(TileBoard(items: SampleData.presentations(count: n, now: now), size: display.size,
-                              insets: display.insets, connection: connection, armedID: armed))
+        func tiles(_ n: Int, connection: ConnectionState = .live, open: String? = nil) -> AnyView {
+            let items = SampleData.presentations(count: n, now: now)
+            var swipe = SwipeReveal()
+            if let open {
+                // Drive the real state machine: swipe the tile left past half-way.
+                let slot = TileGeometry.slots(for: TilePlan(ordered: items).arrangement, in: display.size, insets: display.insets)
+                let reveal = SwipeReveal.revealWidth(tileWidth: slot[items.firstIndex { $0.id == open } ?? 0].frame.width)
+                swipe.dragChanged(open, dx: -reveal, dy: 0)
+                swipe.dragEnded(open, predictedDX: -reveal, revealWidth: reveal, now: now)
+            }
+            return AnyView(TileBoard(items: items, size: display.size, insets: display.insets,
+                                     connection: connection, swipe: swipe))
         }
         func state<V: View>(_ v: V) -> AnyView {
             AnyView(v.padding(.top, display.topInset).frame(width: display.size.width, height: display.size.height))
         }
+        func detail(_ id: String) -> AnyView {
+            let p = SampleData.presentations(count: 6, now: now).first { $0.id == id }!
+            return AnyView(SessionDetail(p: p)
+                .padding(.top, display.topInset)
+                .background(TileStyle.of(p.tone, dimmed: false).fill)
+                .overlay(alignment: .topLeading) { SheetCloseStandIn(display: display) })
+        }
         var out: [(String, AnyView)] = [("tiles-0", state(EmptySessionsView(openSettings: {})))]
         for n in [1, 2, 3, 4, 6] { out.append(("tiles-\(n)", tiles(n))) }
-        out.append(("tiles-6-tap-again", tiles(6, armed: "codex:p")))
+        out.append(("tiles-3-swiped", tiles(3, open: "claude:a")))
+        out.append(("tiles-4-swiped", tiles(4, open: "codex:b")))
+        out.append(("detail-done", detail("claude:d")))
+        out.append(("detail-ask", detail("codex:b")))
+        out.append(("detail-run", detail("codex:i")))
         out.append(("tiles-3-offline", tiles(3, connection: .unreachable("Connection refused"))))
         out.append(("tiles-4-always-on", AnyView(tiles(4).environment(\.isLuminanceReduced, true))))
         out.append(("unreachable", state(UnreachableView(
@@ -86,6 +108,21 @@ public enum ScreenCatalog {
             )))),
             ("widget-empty", AnyView(StatusCountsWidgetView(snapshot: nil))),
         ]
+    }
+}
+
+/// Stand-in for the close button watchOS draws on a sheet (renders only).
+struct SheetCloseStandIn: View {
+    let display: WatchDisplay
+
+    var body: some View {
+        Image(systemName: "xmark")
+            .font(.system(size: display.topInset * 0.38, weight: .bold))
+            .foregroundStyle(.white)
+            .frame(width: display.topInset * 0.85, height: display.topInset * 0.85)
+            .background(Circle().fill(Color(white: 0.25)))
+            .padding(.leading, display.cornerRadius * 0.45)
+            .frame(height: display.topInset)
     }
 }
 

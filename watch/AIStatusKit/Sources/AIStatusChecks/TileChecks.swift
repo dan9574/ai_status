@@ -2,8 +2,9 @@ import AIStatusKit
 import CoreGraphics
 import Foundation
 
-/// The tile screen's logic: arrangement per count, top-4 selection and "+N",
-/// slot geometry, tap-to-clear state machine, Always-On durations.
+/// The tile screen's logic: arrangement per count, stable order and the first-4
+/// selection with "+N", slot geometry, tile labels, swipe-to-delete state
+/// machine, Always-On durations.
 @MainActor
 func runTileChecks() async {
     suite("tiles: arrangement by session count") {
@@ -19,36 +20,68 @@ func runTileChecks() async {
         expectEqual(TileArrangement.rows(3).columns, 1, "rows are full width")
     }
 
-    suite("tiles: top-4 selection and +N") {
+    suite("tiles: first 4 by start time and +N") {
         let cards = [
             card("claude:r-old", .running, started: 10),
             card("claude:r-new", .running, started: 90),
             card("claude:d-new", .done, started: 1, finished: 80),
             card("claude:w-new", .waiting, started: 5, waiting: 70),
-            card("codex:d-old", .done, started: 2, finished: 40, policy: .swipe),
+            card("codex:d-old", .done, started: 2, finished: 40),
             card("codex:w-old", .waiting, started: 6, waiting: 30),
             card("codex:d-mid", .done, started: 3, finished: 60),
         ]
         let plan = TilePlan(cards: cards)
         expectEqual(plan.arrangement, .grid, "7 sessions => grid")
-        expectEqual(plan.tiles.map(\.id), ["codex:w-old", "claude:w-new", "codex:d-old", "codex:d-mid"],
-                    "waiting (longest waiting first), then done (oldest finished first)")
+        expectEqual(plan.tiles.map(\.id), ["claude:d-new", "codex:d-old", "codex:d-mid", "claude:w-new"],
+                    "oldest start first, whatever the status (no waiting-first importance order)")
         expectEqual(plan.overflow, 3, "+3 badge")
-        let few = TilePlan(cards: [card("claude:r", .running, started: 1), card("claude:d", .done, started: 1, finished: 5)])
+        let few = TilePlan(cards: [card("claude:r", .running, started: 1), card("claude:d", .done, started: 2, finished: 5)])
         expectEqual(few.arrangement, .rows(2), "2 sessions => 2 rows")
-        expectEqual(few.tiles.map(\.id), ["claude:d", "claude:r"], "done above running")
+        expectEqual(few.tiles.map(\.id), ["claude:r", "claude:d"], "running started first stays above done")
         expectEqual(few.overflow, 0, "no badge when everything fits")
         let four = TilePlan(cards: Array(cards.prefix(4)))
         expectEqual(four.overflow, 0, "exactly 4: no badge")
-        expectEqual(four.tiles.last?.id, "claude:r-new", "running fills the rest, oldest start first")
-        let running = TilePlan(cards: [card("claude:b", .running, started: 50), card("claude:a", .running, started: 20),
-                                       card("claude:c", .running, started: 70), card("claude:d", .running, started: 10),
-                                       card("claude:e", .running, started: 5)])
-        expectEqual(running.tiles.map(\.id), ["claude:e", "claude:d", "claude:a", "claude:b"], "running only: existing WatchOrdering")
-        expectEqual(running.overflow, 1, "+1 badge")
+        expectEqual(four.tiles.map(\.id), ["claude:d-new", "claude:w-new", "claude:r-old", "claude:r-new"], "4: all shown in start order")
+        let five = TilePlan(cards: [card("claude:b", .running, started: 50), card("claude:a", .waiting, started: 20, waiting: 99),
+                                    card("claude:c", .done, started: 70, finished: 80), card("claude:d", .running, started: 10),
+                                    card("claude:e", .waiting, started: 95, waiting: 96)])
+        expectEqual(five.tiles.map(\.id), ["claude:d", "claude:a", "claude:b", "claude:c"], "5: newest-started session is the one left out")
+        expectEqual(five.overflow, 1, "+1 badge")
         let none = TilePlan<SessionCard>(ordered: [])
         expectEqual(none.arrangement, .empty, "0 sessions => empty")
         check(none.tiles.isEmpty && none.overflow == 0, "empty plan")
+    }
+
+    suite("tiles: stable order (status changes never move a tile)") {
+        var order = SessionOrder()
+        let a = card("claude:a", .running, started: 100)
+        let b = card("codex:b", .running, started: 200)
+        let c = card("claude:c", .waiting, started: 300, waiting: 310)
+        order.update(with: [c, a, b])
+        expectEqual(order.sorted([c, b, a]).map(\.id), ["claude:a", "codex:b", "claude:c"], "start order, independent of input order")
+        // a finishes, b asks, c gets approval and runs again.
+        var a2 = card("claude:a", .done, started: 100, finished: 400)
+        let b2 = card("codex:b", .waiting, started: 200, waiting: 410)
+        let c2 = card("claude:c", .running, started: 300)
+        order.update(with: [a2, b2, c2])
+        expectEqual(order.sorted([c2, b2, a2]).map(\.id), ["claude:a", "codex:b", "claude:c"], "status changes keep positions")
+        // a starts a new run (startedAt moves past everyone): still first.
+        a2 = card("claude:a", .running, started: 500)
+        order.update(with: [a2, b2, c2])
+        expectEqual(order.sorted([a2, b2, c2]).map(\.id), ["claude:a", "codex:b", "claude:c"], "a new run keeps the first-seen start")
+        expectEqual(order.key(a2), 100, "remembered start")
+        // A new session goes last; a cleared one is forgotten and comes back by its new start.
+        let d = card("codex:d", .running, started: 450)
+        order.update(with: [b2, c2, d])
+        a2 = card("claude:a", .running, started: 600)
+        expectEqual(order.sorted([a2, b2, c2, d]).map(\.id), ["codex:b", "claude:c", "codex:d", "claude:a"], "cleared then back: placed by its new start")
+        // Ties and missing times.
+        let t1 = card("codex:t", .done, finished: 5), t2 = card("claude:t", .done, finished: 5)
+        let unknown = SessionCard(id: "x:u", tool: .other("x"), sessionId: "u", status: .other("idle"))
+        expectEqual(SessionOrder().sorted([unknown, t1, t2]).map(\.id), ["claude:t", "codex:t", "x:u"], "ties by id, unknown start last")
+        expectEqual(SessionOrder.startKey(card("claude:w", .waiting, waiting: 7)), 7, "no startedAt: falls back to waitingSince")
+        order.reset()
+        expectEqual(order.key(a2), 600, "reset forgets remembered starts")
     }
 
     suite("tiles: geometry fills the screen") {
@@ -87,89 +120,166 @@ func runTileChecks() async {
         check(grid[0].content.width > 75 && grid[0].content.height > 80, "40 mm grid tile text area \(grid[0].content.size)")
     }
 
-    suite("tiles: tap to clear") {
-        let t0 = Date(timeIntervalSince1970: 1_000)
+    suite("tiles: labels (status word + timer)") {
         let clock = ClockSync()
         func p(_ c: SessionCard) -> CardPresentation { CardPresentation(card: c, clock: clock) }
-        let running = p(card("claude:r", .running, started: 1))
-        let waiting = p(card("claude:w", .waiting, started: 1, waiting: 2))
-        let short = p(card("claude:s", .done, started: 1, finished: 2, policy: .swipe))
-        let long = p(card("codex:l", .done, started: 1, finished: 900_000, policy: .confirm))
-        let long2 = p(card("codex:m", .done, started: 1, finished: 800_000, policy: .confirm))
-        var failedCard = card("codex:f", .done, started: 1, finished: 5, policy: .swipe)
-        failedCard.error = "rate_limit"
-        let failed = p(failedCard)
-
-        var taps = TapToClear()
-        expectEqual(taps.timeout, 3, "default confirm window")
-        expectEqual(taps.tap(running, now: t0), .ignored, "running: tap does nothing")
-        expectEqual(taps.tap(waiting, now: t0), .ignored, "waiting: tap does nothing")
-        check(taps.armedID == nil, "nothing armed by running/waiting taps")
-        expectEqual(taps.tap(short, now: t0), .clear("claude:s"), "short task (swipe policy): first tap clears")
-        expectEqual(taps.tap(failed, now: t0), .clear("codex:f"), "failed/interrupted done tiles clear too")
-
-        // Long task: tap, tap again.
-        expectEqual(taps.tap(long, now: t0), .armed("codex:l"), "long task: first tap arms")
-        check(taps.isArmed("codex:l", now: t0.addingTimeInterval(1)), "armed shows 'tap again'")
-        expectEqual(taps.expiresAt, t0.addingTimeInterval(3), "reverts after the window")
-        expectEqual(taps.tap(long, now: t0.addingTimeInterval(2.9)), .clear("codex:l"), "second tap within the window clears")
-        check(taps.armedID == nil, "disarmed after clearing")
-
-        // Timeout: reverts, next tap arms again instead of clearing.
-        _ = taps.tap(long, now: t0)
-        check(!taps.expire(now: t0.addingTimeInterval(2)), "no revert before the window ends")
-        check(taps.expire(now: t0.addingTimeInterval(3)), "reverts when the window ends")
-        check(taps.armedID == nil && taps.armedAt == nil, "back to normal")
-        _ = taps.tap(long, now: t0)
-        expectEqual(taps.tap(long, now: t0.addingTimeInterval(3.5)), .armed("codex:l"), "late second tap (view not yet reverted) re-arms, never clears")
-
-        // Only one armed tile.
-        expectEqual(taps.tap(long2, now: t0.addingTimeInterval(4)), .armed("codex:m"), "arming another tile")
-        check(!taps.isArmed("codex:l", now: t0.addingTimeInterval(4)) && taps.isArmed("codex:m", now: t0.addingTimeInterval(4)), "moves the armed state")
-        expectEqual(taps.tap(running, now: t0.addingTimeInterval(4.5)), .ignored, "tap on a running tile")
-        check(taps.isArmed("codex:m", now: t0.addingTimeInterval(4.5)), "…leaves the armed tile alone")
-        expectEqual(taps.tap(long, now: t0.addingTimeInterval(5)), .armed("codex:l"), "first tap on the other long tile arms it, does not clear")
-
-        // Reconcile with new snapshots.
-        check(!taps.reconcile(with: [long, long2]), "armed tile still done: kept")
-        var restarted = card("codex:l", .running, started: 950_000)
-        restarted.updatedAt = 950_000
-        check(taps.reconcile(with: [p(restarted), long2]), "armed tile started a new run: disarmed")
-        _ = taps.tap(long2, now: t0)
-        check(taps.reconcile(with: [long]), "armed tile cleared elsewhere: disarmed")
-        check(taps.armedID == nil, "nothing armed")
+        var failed = card("codex:f", .done, started: 1, finished: 5)
+        failed.error = "rate_limit"
+        var interrupted = card("codex:x", .done, started: 1, finished: 5)
+        interrupted.interrupted = true
+        expectEqual(TileLabel.word(p(card("claude:r", .running, started: 1)).tone), "run", "running => run")
+        expectEqual(TileLabel.word(p(card("claude:w", .waiting, started: 1, waiting: 2)).tone), "ask", "waiting => ask")
+        expectEqual(TileLabel.word(p(card("claude:d", .done, started: 1, finished: 2)).tone), "done", "done => done")
+        expectEqual(TileLabel.word(p(failed).tone), "done", "failed counts as done")
+        expectEqual(TileLabel.word(p(interrupted).tone), "done", "interrupted counts as done")
+        expectEqual(TileLabel.status(.running, elapsed: 754), "run · 12:34", "running line")
+        expectEqual(TileLabel.status(.waiting, elapsed: 41), "ask · 0:41", "waiting line")
+        expectEqual(TileLabel.status(.done, elapsed: 182), "done · 3:02", "done line")
+        expectEqual(TileLabel.status(.running, elapsed: 754, compact: true), "run 12:34", "2x2 grid: no dot")
+        expectEqual(TileLabel.status(.done, elapsed: 754, coarse: true), "done · 12m", "Always-On: minutes")
+        expectEqual(TileLabel.status(.waiting, elapsed: 30, compact: true, coarse: true), "ask <1m", "Always-On grid")
+        expectEqual(TileLabel.status(.unknown, elapsed: nil), "?", "no timer: word only")
+        let clocks: [(TimeInterval, String)] = [
+            (0, "0:00"), (9.99, "0:09"), (41, "0:41"), (60, "1:00"), (754, "12:34"), (3599, "59:59"), (3600, "1:00:00"),
+            (3912, "1:05:12"), (86_399, "23:59:59"), (93_600, "1d 2h"), (-3, "0:00"),
+        ]
+        for (s, want) in clocks { expectEqual(ElapsedClock.format(s), want, "clock \(s)s") }
+        // Timer starts: run from startedAt, ask from waitingSince, done from finishedAt.
+        expectEqual(p(card("claude:r", .running, started: 10_000)).timerStart, Date(timeIntervalSince1970: 10), "run counts from startedAt")
+        expectEqual(p(card("claude:d", .done, started: 10_000, finished: 50_000)).timerStart, Date(timeIntervalSince1970: 50), "done counts from finishedAt")
+        // Tile text never carries the project name.
+        check(!TileLabel.status(.running, elapsed: 5).contains("p-r"), "no project on the tile")
     }
 
-    await asyncSuite("tiles: tap clears through the view model") {
+    suite("tiles: swipe to reveal delete") {
+        let t0 = Date(timeIntervalSince1970: 1_000)
+        let w: CGFloat = 40
+        var s = SwipeReveal()
+        expectEqual(s.timeout, 4, "default inactivity timeout")
+        expectEqual(SwipeReveal.revealWidth(tileWidth: 80), 40, "grid tile: half its width")
+        expectEqual(SwipeReveal.revealWidth(tileWidth: 162), 60, "full-width tile: capped at 60")
+        expectEqual(s.tapTile("a", now: t0), .showDetail("a"), "tap with nothing open => detail")
+        expectEqual(s.tapTrash("a"), .ignored, "trash of a closed tile does nothing")
+
+        // Drag follows the finger, clamped.
+        s.dragChanged("a", dx: -15, dy: 3)
+        expectEqual(s.offset(for: "a", revealWidth: w), -15, "follows the finger")
+        expectEqual(s.offset(for: "b", revealWidth: w), 0, "other tiles stay put")
+        s.dragChanged("a", dx: -200, dy: 3)
+        expectEqual(s.offset(for: "a", revealWidth: w), -(w + SwipeReveal.overshoot), "clamped past fully open")
+        s.dragChanged("a", dx: 30, dy: 0)
+        expectEqual(s.offset(for: "a", revealWidth: w), 0, "cannot slide right of closed")
+        expectEqual(s.tapTile("a", now: t0), .ignored, "tap during a drag ignored")
+        // Short drag snaps back; past half-way opens.
+        check(!s.dragEnded("a", predictedDX: -15, revealWidth: w, now: t0), "less than half-way: stays closed")
+        expectEqual(s.offset(for: "a", revealWidth: w), 0, "snapped back")
+        expectEqual(s.tapTile("a", now: t0.addingTimeInterval(0.1)), .ignored, "tap from the same touch as the swipe ignored")
+        s.dragChanged("a", dx: -12, dy: 0)
+        check(s.dragEnded("a", predictedDX: -35, revealWidth: w, now: t0), "flick (predicted end past half-way) opens")
+        check(s.isOpen("a"), "a open")
+        expectEqual(s.offset(for: "a", revealWidth: w), -w, "open offset = trash width")
+        expectEqual(s.expiresAt, t0.addingTimeInterval(4), "closes 4 s after opening")
+
+        // Vertical movement is not a swipe.
+        s.dragChanged("b", dx: 4, dy: 20)
+        check(s.dragID == nil && s.isOpen("a"), "vertical drag on b: ignored, a stays open")
+
+        // Only one open: dragging b closes a; b opens.
+        s.dragChanged("b", dx: -10, dy: 2)
+        check(!s.isOpen("a"), "starting to drag b closes a")
+        s.dragEnded("b", predictedDX: -30, revealWidth: w, now: t0.addingTimeInterval(1))
+        check(s.isOpen("b") && !s.isOpen("a"), "only b open")
+
+        // Swipe right closes.
+        s.dragChanged("b", dx: 25, dy: 0)
+        expectEqual(s.offset(for: "b", revealWidth: w), -w + 25, "dragging the open tile back")
+        check(!s.dragEnded("b", predictedDX: 25, revealWidth: w, now: t0.addingTimeInterval(2)), "swipe right closes")
+        check(s.openID == nil, "nothing open")
+
+        // Tapping elsewhere closes (and does nothing else).
+        s.dragChanged("b", dx: -30, dy: 0)
+        s.dragEnded("b", predictedDX: -30, revealWidth: w, now: t0.addingTimeInterval(3))
+        expectEqual(s.tapTile("c", now: t0.addingTimeInterval(4)), .closed, "tap another tile: closes b, no detail")
+        check(s.openID == nil, "closed")
+        s.dragChanged("b", dx: -30, dy: 0)
+        s.dragEnded("b", predictedDX: -30, revealWidth: w, now: t0.addingTimeInterval(5))
+        expectEqual(s.tapTile("b", now: t0.addingTimeInterval(6)), .closed, "tap the open tile itself: closes")
+        s.dragChanged("b", dx: -30, dy: 0)
+        s.dragEnded("b", predictedDX: -30, revealWidth: w, now: t0.addingTimeInterval(7))
+        check(s.close() && s.openID == nil, "background tap / long press closes")
+
+        // Inactivity timeout.
+        s.dragChanged("b", dx: -30, dy: 0)
+        s.dragEnded("b", predictedDX: -30, revealWidth: w, now: t0)
+        check(!s.expire(now: t0.addingTimeInterval(3.9)), "still open before the timeout")
+        s.dragChanged("b", dx: 5, dy: 0)
+        check(!s.expire(now: t0.addingTimeInterval(9)), "not while the finger is on it")
+        s.dragCancelled("b")
+        expectEqual(s.offset(for: "b", revealWidth: w), -w, "cancelled touch: back to open, unchanged")
+        check(s.expire(now: t0.addingTimeInterval(9)), "closes after the timeout")
+        check(s.openID == nil && s.expiresAt == nil, "back to normal")
+
+        // Delete.
+        s.dragChanged("b", dx: -30, dy: 0)
+        s.dragEnded("b", predictedDX: -30, revealWidth: w, now: t0)
+        expectEqual(s.tapTrash("c"), .ignored, "trash of another tile ignored")
+        expectEqual(s.tapTrash("b"), .delete("b"), "trash of the open tile deletes it")
+        check(s.openID == nil, "closed after delete")
+        expectEqual(s.tapTrash("b"), .ignored, "double tap on trash deletes once")
+
+        // Reconcile with the tiles on screen.
+        s.dragChanged("a", dx: -30, dy: 0)
+        s.dragEnded("a", predictedDX: -30, revealWidth: w, now: t0)
+        check(!s.reconcile(visible: ["a", "b"]), "open tile still on screen: kept")
+        check(s.reconcile(visible: ["b"]), "open tile gone (deleted elsewhere / pushed out): closed")
+        s.dragChanged("b", dx: -5, dy: 0)
+        s.reconcile(visible: ["a"])
+        check(s.dragID == nil, "drag of a vanished tile dropped")
+    }
+
+    await asyncSuite("tiles: swipe + trash deletes through the view model (any status)") {
         let t = Int64(Date().timeIntervalSince1970 * 1000)
         let snap = Snapshot(serverTime: t, sessions: [
             card("claude:s", .done, started: t - 20_000, finished: t - 10_000, policy: .swipe),
             card("codex:l", .done, started: t - 900_000, finished: t - 60_000, policy: .confirm),
             card("claude:r", .running, started: t - 5_000),
+            card("codex:w", .waiting, started: t - 7_000, waiting: t - 1_000),
         ])
         let fake = FakeTransport(stream: .deliver([snap], thenFail: false), poll: .success(snap))
         let model = StatusModel(sleeper: fastSleeper, makeTransport: { _ in fake })
         model.start(endpoint: DaemonEndpoint(host: "mac"))
         try await waitUntil { model.hasData }
-        var taps = TapToClear()
-        @MainActor func tap(_ id: String, at offset: TimeInterval) async {
-            guard let p = model.presentations.first(where: { $0.id == id }) else { return check(false, "\(id) on screen") }
-            if case .clear(let id) = taps.tap(p, now: Date().addingTimeInterval(offset)) { await model.dismiss(id: id) }
+        var swipe = SwipeReveal()
+        @MainActor func swipeAndTrash(_ id: String) async {
+            swipe.dragChanged(id, dx: -40, dy: 0)
+            swipe.dragEnded(id, predictedDX: -40, revealWidth: 40, now: Date())
+            if case .delete(let id) = swipe.tapTrash(id) { await model.dismiss(id: id) }
         }
-        expectEqual(TilePlan(ordered: model.presentations).arrangement, .rows(3), "3 sessions => 3 rows")
-        await tap("claude:r", at: 0)
-        await tap("claude:s", at: 0)
-        expectEqual(fake.dismissed, ["claude:s"], "short task: one tap sends dismiss")
-        expectEqual(model.cards.map(\.id), ["codex:l", "claude:r"], "removed at once (optimistic)")
-        await tap("codex:l", at: 0)
-        expectEqual(fake.dismissed, ["claude:s"], "long task: first tap sends nothing")
-        await tap("codex:l", at: 1)
-        expectEqual(fake.dismissed, ["claude:s", "codex:l"], "long task: second tap sends dismiss")
+        expectEqual(model.cards.map(\.id), ["codex:l", "claude:s", "codex:w", "claude:r"], "model keeps start order")
+        expectEqual(TilePlan(ordered: model.presentations).arrangement, .grid, "4 sessions => grid")
+        for id in ["claude:r", "codex:w", "codex:l"] {
+            if case .showDetail = swipe.tapTile(id, now: Date().addingTimeInterval(1)) {} else { check(false, "tap \(id) => detail") }
+        }
+        expectEqual(fake.dismissed, [], "taps never delete")
+        await swipeAndTrash("claude:r")
+        expectEqual(fake.dismissed, ["claude:r"], "running session deleted")
+        await swipeAndTrash("codex:w")
+        expectEqual(fake.dismissed, ["claude:r", "codex:w"], "waiting session deleted")
+        await swipeAndTrash("codex:l")
+        expectEqual(fake.dismissed, ["claude:r", "codex:w", "codex:l"], "long done session: one trash tap, no confirm step")
+        expectEqual(model.cards.map(\.id), ["claude:s"], "removed at once (optimistic)")
         expectEqual(TilePlan(ordered: model.presentations).arrangement, .single, "one session left => whole screen")
+        // Failure: the tile comes back in its place.
+        let more = Snapshot(serverTime: t + 1, sessions: snap.sessions.filter { $0.id == "claude:s" } + [card("codex:n", .running, started: t)])
+        model.ingest(timed(more))
+        fake.set(dismiss: .failure(.network("No network")))
+        await swipeAndTrash("claude:s")
+        expectEqual(model.cards.map(\.id), ["claude:s", "codex:n"], "failed delete restores the tile in the same place")
+        check(model.transientError != nil, "error surfaced")
         model.stop()
     }
 
-    suite("tiles: waiting timer and Always-On durations") {
+    suite("tiles: ask timer fallbacks and Always-On durations") {
         let clock = ClockSync()
         let w = CardPresentation(card: card("claude:w", .waiting, started: 10_000, waiting: 70_000), clock: clock)
         expectEqual(w.timerStart, Date(timeIntervalSince1970: 70), "waiting counts from waitingSince")

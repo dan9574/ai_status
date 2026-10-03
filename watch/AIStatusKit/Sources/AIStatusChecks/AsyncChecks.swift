@@ -113,7 +113,7 @@ func runModelChecks() async {
         model.start(endpoint: DaemonEndpoint(host: "mac"))
         try await waitUntil { model.hasData }
         expectEqual(model.connection, .live, "live")
-        expectEqual(model.cards.first?.project, "proj-wait", "waiting card first")
+        expectEqual(model.cards.map(\.id), SessionOrder().sorted(mixed.sessions).map(\.id), "cards in start order (no waiting-first)")
         expectEqual(model.cards.count, 8, "all cards")
         expectEqual(model.counts, StatusCounts(running: 2, waiting: 2, done: 4), "counts")
         expectEqual(transitions, [], "first snapshot does not buzz")
@@ -156,7 +156,6 @@ func runModelChecks() async {
         model.start(endpoint: DaemonEndpoint(host: "mac"))
         try await waitUntil { model.hasData }
         let quick = model.cards.first { $0.project == "proj-quick" }!
-        expectEqual(quick.dismissPolicy, .swipe, "quick card is swipeable")
         await model.dismiss(id: quick.id)
         expectEqual(fake.dismissed, [quick.id], "POST dismiss sent with full id")
         check(!model.cards.contains { $0.id == quick.id }, "hidden immediately")

@@ -1,49 +1,39 @@
 import AIStatusKit
 import SwiftUI
 
-extension AgentTool {
-    /// Tiny tool marker on a tile: Claude = sparkle, Codex = </>. Monochrome so
-    /// it reads on every tile colour; the shape alone tells them apart.
-    var tileSymbol: String {
-        switch self {
-        case .claude: return "sparkle"
-        case .codex: return "chevron.left.forwardslash.chevron.right"
-        case .other: return "cpu"
-        }
+extension Color {
+    /// 0xRRGGBB, optionally scaled towards black (`brightness` 1 = as given).
+    init(hex: UInt32, brightness: Double = 1) {
+        self.init(
+            red: Double((hex >> 16) & 0xFF) / 255 * brightness,
+            green: Double((hex >> 8) & 0xFF) / 255 * brightness,
+            blue: Double(hex & 0xFF) / 255 * brightness
+        )
     }
 }
 
-/// Colours of one tile. Running = grey (calm), done = green, waiting = orange.
-/// With Always-On (luminance reduced) the fills drop to dark shades and the text
-/// takes the hue, so the screen stays readable without lighting up the wrist.
+/// Colours of one tile: a very dark tinted fill with lighter same-hue text.
+/// Running = grey, waiting ("ask") = amber, done = green. In Always-On
+/// (luminance reduced) both drop a little further.
 struct TileStyle {
     var fill: Color
     var text: Color
-    var secondary: Color
 
     static func of(_ tone: CardPresentation.Tone, dimmed: Bool) -> TileStyle {
-        switch (tone, dimmed) {
-        case (.waiting, false):
-            return TileStyle(fill: Color(red: 1.0, green: 0.58, blue: 0.0), text: .black, secondary: .black.opacity(0.6))
-        case (.waiting, true):
-            return TileStyle(fill: Color(red: 0.30, green: 0.16, blue: 0.0), text: Color(red: 1.0, green: 0.72, blue: 0.4), secondary: Color(red: 1.0, green: 0.72, blue: 0.4).opacity(0.7))
-        case (.done, false), (.failed, false):
-            return TileStyle(fill: Color(red: 0.19, green: 0.78, blue: 0.35), text: .black, secondary: .black.opacity(0.6))
-        case (.done, true), (.failed, true):
-            return TileStyle(fill: Color(red: 0.0, green: 0.22, blue: 0.08), text: Color(red: 0.5, green: 0.92, blue: 0.6), secondary: Color(red: 0.5, green: 0.92, blue: 0.6).opacity(0.7))
-        case (_, false):
-            return TileStyle(fill: Color(white: 0.24), text: .white, secondary: .white.opacity(0.6))
-        case (_, true):
-            return TileStyle(fill: Color(white: 0.11), text: .white.opacity(0.75), secondary: .white.opacity(0.5))
+        let (fill, text): (UInt32, UInt32)
+        switch tone {
+        case .waiting: (fill, text) = (0x412402, 0xFAC775)
+        case .done, .failed: (fill, text) = (0x173404, 0xC0DD97)
+        case .running, .unknown: (fill, text) = (0x2C2C2A, 0xD3D1C7)
         }
+        // Always-On: darker fill, slightly dimmer text, same hue.
+        return TileStyle(fill: Color(hex: fill, brightness: dimmed ? 0.55 : 1),
+                         text: Color(hex: text, brightness: dimmed ? 0.75 : 1))
     }
 
-    /// A long-task done tile after the first tap ("tap again to clear").
-    static func armed(dimmed: Bool) -> TileStyle {
-        dimmed
-            ? TileStyle(fill: Color(red: 0.0, green: 0.12, blue: 0.04), text: .white.opacity(0.8), secondary: .white.opacity(0.6))
-            : TileStyle(fill: Color(red: 0.05, green: 0.36, blue: 0.15), text: .white, secondary: .white.opacity(0.75))
-    }
+    /// The trash button revealed by swiping a tile left.
+    static let trashFill = Color(hex: 0x791F1F)
+    static let trashIcon = Color(hex: 0xF7C1C1)
 }
 
 extension ConnectionState {

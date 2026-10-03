@@ -34,10 +34,11 @@ public enum Transition: Equatable, Sendable {
 }
 
 /// The watch app's single source of truth. Owns the feed task, applies snapshots,
-/// keeps the clock offset, orders cards, and performs dismissals optimistically.
+/// keeps the clock offset, keeps cards in a stable order (`SessionOrder`), and
+/// performs dismissals optimistically.
 @MainActor
 public final class StatusModel: ObservableObject {
-    /// Visible cards in watch order (pending dismissals hidden).
+    /// Visible cards in stable start order (pending dismissals hidden).
     @Published public private(set) var cards: [SessionCard] = []
     @Published public private(set) var connection: ConnectionState = .connecting
     /// Local time the last snapshot arrived.
@@ -65,6 +66,7 @@ public final class StatusModel: ObservableObject {
     /// server stops reporting that exact version of the card.
     private var pendingDismiss: [String: Int64?] = [:]
     private var previousStatus: [String: SessionStatus]?
+    private var order = SessionOrder()
     private var lastSummary: SharedSnapshot?
     private var feedTask: Task<Void, Never>?
     private var transport: DaemonTransport?
@@ -96,6 +98,7 @@ public final class StatusModel: ObservableObject {
             cards = []
             pendingDismiss = [:]
             previousStatus = nil
+            order.reset()
             lastUpdate = nil
             clock.reset()
             connection = .connecting
@@ -151,6 +154,7 @@ public final class StatusModel: ObservableObject {
         let transitions = Transition.between(previous: previousStatus, current: incoming)
         previousStatus = Dictionary(incoming.map { ($0.id, $0.status) }, uniquingKeysWith: { a, _ in a })
         serverCards = incoming
+        order.update(with: incoming)
         lastUpdate = now()
         recompute()
         if let top = transitions.filter({ id in !isHidden(id) }).max(by: { $0.priority < $1.priority }) {
@@ -169,13 +173,12 @@ public final class StatusModel: ObservableObject {
 
     private func recompute() {
         let visible = serverCards.filter { pendingDismiss[$0.id] == nil }
-        let ordered = WatchOrdering.sorted(visible)
+        let ordered = order.sorted(visible)
         if ordered != cards { cards = ordered }
     }
 
     /// Clear a card: hide it immediately, then `POST /sessions/:id/dismiss`.
-    /// On failure the card comes back and `transientError` is set.
-    /// The confirm-vs-swipe decision is the UI's job (see `DismissPolicy`).
+    /// On failure the card comes back (in the same place) and `transientError` is set.
     public func dismiss(id: String) async {
         guard let transport else { return }
         let version = serverCards.first(where: { $0.id == id })?.updatedAt
