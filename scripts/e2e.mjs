@@ -16,7 +16,7 @@ import { fileURLToPath } from 'node:url';
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const PORT = Number(process.argv[2] || 17778);
 const HOME = fs.mkdtempSync(path.join(os.tmpdir(), 'aistatus-e2e-'));
-const env = { ...process.env, HOME, AISTATUS_PORT: String(PORT) };
+const env = { ...process.env, HOME, AISTATUS_PORT: String(PORT), AISTATUS_PUBLIC_PORT: 'off' };
 delete env.AISTATUS_DIR;
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 let failures = 0;

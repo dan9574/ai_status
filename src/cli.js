@@ -17,13 +17,24 @@ Usage:
   aistatus install-hooks [--claude] [--codex] [--port N]
   aistatus uninstall-hooks [--claude] [--codex]
   aistatus install-daemon [--print]   write the launchd plist (does not load it)
-  aistatus token [--new [--hooks-only]]
-                                print the token remote hook senders must use;
-                                --new generates and saves one ("token": also
-                                required from the watch; --hooks-only saves it as
-                                "hookToken", which only guards remote hooks)
-  aistatus remote-setup         values + install command for another computer
+  aistatus token [--read] [--new [--hooks-only | --shared]]
+                                print the token remote hook senders must use
+                                (--read: the token the watch must use);
+                                --new generates and saves "token" (watch/reads,
+                                and hooks unless a hookToken is set);
+                                --new --hooks-only saves "hookToken" (hooks only);
+                                --new --shared saves "token" and removes
+                                "hookToken" (one token for everything)
+  aistatus remote-setup [--public-url URL]
+                                values + install command for another computer
                                 (e.g. a Windows PC running Codex)
+  aistatus public-url [URL | --clear]
+                                show / save the public base URL of the tunnel
+                                (e.g. https://mac.tailnet.ts.net)
+  aistatus public-status [--show] [--no-probe]
+                                is the public listener (publicPort) up, which
+                                tokens are set (--show prints them), and does
+                                the public URL answer
 
 Options:
   --port N    daemon port (default from ~/.aistatus/config.json, else 7778)
@@ -37,7 +48,7 @@ function parseArgs(argv) {
     if (a.startsWith('--')) {
       const [k, v] = a.slice(2).split('=');
       if (v !== undefined) args.flags[k] = v;
-      else if (['port', 'host'].includes(k)) args.flags[k] = argv[++i];
+      else if (['port', 'host', 'public-url'].includes(k)) args.flags[k] = argv[++i];
       else args.flags[k] = true;
     } else args._.push(a);
   }
@@ -186,16 +197,31 @@ function tokenCommand(flags) {
   if (flags.new) {
     const key = flags['hooks-only'] ? 'hookToken' : 'token';
     const token = generateToken();
-    updateUserConfig({ [key]: token }, p);
+    const patch = { [key]: token };
+    const dropHook = !!flags.shared && key === 'token';
+    if (dropHook) patch.hookToken = undefined;
+    updateUserConfig(patch, p);
     console.log(token);
-    console.error(`saved as "${key}" in ${p.configFile} (mode 600). Restart the daemon to apply it.`);
+    console.error(`saved as "${key}" in ${p.configFile} (mode 600)${dropHook ? ' and removed "hookToken"' : ''}. Restart the daemon to apply it.`);
     if (key === 'token') {
-      console.error('note: "token" also protects reads from other devices: enter it in the watch app settings (Token),');
-      console.error('      or use `aistatus token --new --hooks-only` to protect remote hooks only.');
+      const cfg = loadConfig(p);
+      console.error('note: "token" is what the watch must send (Settings > Token, or build it in: watch/scripts/generate.sh --token ...).');
+      console.error(cfg.hookToken ? '      Remote hooks keep using "hookToken".' : '      It is also the token for remote hooks (no "hookToken" is set).');
+      console.error('      `aistatus token --new --hooks-only` creates a separate token for remote hooks only.');
     }
     return;
   }
-  const t = hookTokenOf(loadConfig(p));
+  const cfg = loadConfig(p);
+  if (flags.read) {
+    if (!cfg.token) {
+      console.error('no "token" configured: reads are open on the LAN port and the public listener refuses all reads. Create one with: aistatus token --new');
+      process.exitCode = 1;
+      return;
+    }
+    console.log(cfg.token);
+    return;
+  }
+  const t = hookTokenOf(cfg);
   if (!t) {
     console.error('no token configured; remote hooks are disabled. Create one with: aistatus token --new [--hooks-only]');
     process.exitCode = 1;
@@ -204,18 +230,154 @@ function tokenCommand(flags) {
   console.log(t);
 }
 
-export function windowsInstallCommands({ host, port, token, machine }) {
+/** Validate a public base URL: http(s), no credentials, query, fragment or path. Returns its origin or throws. */
+export function normalizePublicUrl(raw) {
+  let u;
+  try {
+    u = new URL(String(raw).trim());
+  } catch {
+    throw new Error(`not a URL: ${raw}`);
+  }
+  if (u.protocol !== 'https:' && u.protocol !== 'http:') throw new Error('the public URL must start with https:// (or http://)');
+  if (u.username || u.password) throw new Error('the public URL must not contain credentials');
+  if (u.search || u.hash) throw new Error('the public URL must not contain a query or fragment');
+  if (u.pathname !== '/' && u.pathname !== '') throw new Error('the public URL must not contain a path (the daemon is served at the root)');
+  return u.origin;
+}
+
+function publicUrlCommand(_, flags) {
+  const p = getPaths();
+  if (flags.clear) {
+    updateUserConfig({ publicUrl: undefined }, p);
+    console.log(`removed "publicUrl" from ${p.configFile}`);
+    return;
+  }
+  if (_[1]) {
+    let url;
+    try {
+      url = normalizePublicUrl(_[1]);
+    } catch (e) {
+      console.error(e.message);
+      process.exitCode = 2;
+      return;
+    }
+    updateUserConfig({ publicUrl: url }, p);
+    console.log(url);
+    console.error(`saved as "publicUrl" in ${p.configFile} (only the CLI uses it; no daemon restart needed).`);
+    if (url.startsWith('http:')) console.error('warning: plain http would send tokens unencrypted over the internet; use the https URL of the tunnel.');
+    return;
+  }
+  const cfg = loadConfig(p);
+  if (!cfg.publicUrl) {
+    console.error('no "publicUrl" configured. Set it with: aistatus public-url https://<your-mac>.<tailnet>.ts.net');
+    process.exitCode = 1;
+    return;
+  }
+  console.log(cfg.publicUrl);
+}
+
+async function probe(url, { token, timeoutMs = 5000 } = {}) {
+  try {
+    const r = await fetch(url, { headers: token ? { Authorization: `Bearer ${token}` } : {}, signal: AbortSignal.timeout(timeoutMs), redirect: 'manual' });
+    const text = await r.text();
+    let body = null;
+    try {
+      body = JSON.parse(text);
+    } catch {
+      /* not JSON */
+    }
+    return { status: r.status, body, text };
+  } catch (e) {
+    return { error: e.name === 'TimeoutError' ? 'timeout' : e.cause?.code || e.cause?.message || e.message };
+  }
+}
+
+async function publicStatus({ cfg, port, flags }) {
+  const { publicListenerPlan, MIN_PUBLIC_TOKEN_LENGTH } = await import('./server.js');
+  const plan = publicListenerPlan(cfg);
+  const show = !!flags.show;
+  const lines = [];
+  let up = false;
+  const weak = (t) => (t && t.length < MIN_PUBLIC_TOKEN_LENGTH ? ` (too short for the public listener: < ${MIN_PUBLIC_TOKEN_LENGTH})` : '');
+  const desc = (t) => (t ? `set (${t.length} characters)${weak(t)}${show ? `  ${t}` : ''}` : 'not set');
+  lines.push('aistatus public listener (for Tailscale Funnel or another tunnel)');
+  lines.push('');
+  lines.push(`  publicPort:   ${plan.port ?? 'disabled'}${plan.port ? ' (bound to 127.0.0.1 only)' : ''}`);
+  lines.push(`  publicUrl:    ${cfg.publicUrl || '(not set) -> aistatus public-url https://<your-mac>.<tailnet>.ts.net'}`);
+  lines.push(`  read token:   ${desc(cfg.token)}   ("token": watch reads + dismiss)`);
+  if (cfg.hookToken) lines.push(`  hook token:   ${desc(cfg.hookToken)}   ("hookToken": remote hooks)`);
+  else lines.push(`  hook token:   ${cfg.token ? 'uses "token" (no separate "hookToken")' : 'not set'}`);
+  if (!plan.enabled) lines.push(`  config:       the public listener will NOT start: ${plan.reason}`);
+
+  let daemon;
+  try {
+    const r = await request('GET', { host: '127.0.0.1', port, path: '/health' });
+    const pub = r.body?.public;
+    if (!pub) daemon = 'running an older version without the public listener -> restart the daemon';
+    else if (pub.listening) {
+      up = true;
+      daemon = `running; public listener up on 127.0.0.1:${pub.port}`;
+      if (plan.port && pub.port !== plan.port) daemon += ` (config says ${plan.port} -> restart the daemon)`;
+    } else daemon = plan.enabled ? 'running WITHOUT the public listener -> restart the daemon (check its log if that does not help)' : 'running; public listener off';
+  } catch (e) {
+    daemon = `not reachable on 127.0.0.1:${port} (${e.code || e.message}) -> start it: aistatus daemon`;
+  }
+  lines.push(`  daemon:       ${daemon}`);
+
+  if (plan.port) {
+    const r = await probe(`http://127.0.0.1:${plan.port}/health`, { timeoutMs: 2000 });
+    lines.push(`  local probe:  http://127.0.0.1:${plan.port}/health -> ${r.error ? `not answering (${r.error})` : `HTTP ${r.status} ${r.text.slice(0, 40)}`}`);
+  }
+  if (cfg.publicUrl && !flags['no-probe']) {
+    const base = cfg.publicUrl.replace(/\/+$/, '');
+    const anon = await probe(`${base}/health`);
+    if (anon.error) lines.push(`  public probe: ${base}/health -> failed (${anon.error}); is \`tailscale funnel --bg ${plan.port ?? 7779}\` running?`);
+    else {
+      lines.push(`  public probe: ${base}/health -> HTTP ${anon.status} ${anon.text.slice(0, 40)}`);
+      // The token is only ever sent over https (never in clear text over the internet).
+      if (cfg.token && base.startsWith('https:')) {
+        const auth = await probe(`${base}/health`, { token: cfg.token });
+        lines.push(`  with token:   ${auth.error ? `failed (${auth.error})` : auth.body?.name === 'aistatusd' ? 'OK, the read token is accepted' : `HTTP ${auth.status}, token not accepted (daemon restarted since the token changed?)`}`);
+      }
+    }
+  }
+  lines.push('');
+  lines.push('To go live:');
+  lines.push('  1. tokens:   aistatus token --new   (optional: aistatus token --new --hooks-only), then restart the daemon');
+  lines.push(`  2. tunnel:   tailscale funnel --bg ${plan.port ?? 7779}   (you run this; aistatus never touches Tailscale)`);
+  lines.push('  3. URL:      aistatus public-url https://<your-mac>.<tailnet>.ts.net');
+  lines.push(`  4. watch:    watch/scripts/generate.sh --host ${cfg.publicUrl || 'https://<your-mac>.<tailnet>.ts.net'} --token "$(aistatus token --read)", then rebuild`);
+  lines.push('  5. Windows:  aistatus remote-setup   (prints the install command with -BaseUrl)');
+  if (!show && (cfg.token || cfg.hookToken)) lines.push('Tokens are hidden; add --show to print them.');
+  console.log(lines.join('\n'));
+  if (!up) process.exitCode = 1;
+}
+
+export function windowsInstallCommands({ host, port, token, machine, baseUrl }) {
   const tok = token || '<TOKEN>';
   const m = machine ? ` -Machine '${machine}'` : '';
+  const b = baseUrl ? ` -BaseUrl '${baseUrl}'` : '';
   const url = `http://${host}:${port}/setup/install-windows.ps1`;
   return {
-    oneLine: `powershell -NoProfile -ExecutionPolicy Bypass -Command "& ([scriptblock]::Create((New-Object Net.WebClient).DownloadString('${url}'))) -MacHost ${host} -Port ${port} -Token '${tok}'${m}"`,
-    fromFiles: `powershell -NoProfile -ExecutionPolicy Bypass -File .\\scripts\\install-windows.ps1 -MacHost ${host} -Port ${port} -Token '${tok}'${m}`,
+    // Fetches the scripts from the Mac's LAN port: only works on the same network.
+    oneLine: `powershell -NoProfile -ExecutionPolicy Bypass -Command "& ([scriptblock]::Create((New-Object Net.WebClient).DownloadString('${url}'))) -MacHost ${host} -Port ${port}${b} -Token '${tok}'${m}"`,
+    fromFiles: baseUrl
+      ? `powershell -NoProfile -ExecutionPolicy Bypass -File .\\scripts\\install-windows.ps1${b} -Token '${tok}'${m}`
+      : `powershell -NoProfile -ExecutionPolicy Bypass -File .\\scripts\\install-windows.ps1 -MacHost ${host} -Port ${port} -Token '${tok}'${m}`,
   };
 }
 
-async function remoteSetup({ cfg, port }) {
+async function remoteSetup({ cfg, port, flags = {} }) {
   const token = hookTokenOf(cfg);
+  let publicUrl = cfg.publicUrl || null;
+  try {
+    if (flags['public-url']) publicUrl = normalizePublicUrl(flags['public-url']);
+    else if (publicUrl) publicUrl = normalizePublicUrl(publicUrl);
+  } catch (e) {
+    console.error(`public URL: ${e.message}`);
+    process.exitCode = 2;
+    return;
+  }
   const ips = lanAddresses();
   const host = ips[0]?.address || '<MAC-IP>';
   const lines = [];
@@ -226,6 +388,7 @@ async function remoteSetup({ cfg, port }) {
   const bj = bonjourHostName();
   if (bj) lines.push(`  Bonjour name:  ${bj}  (Windows may not resolve .local names; prefer the IP)`);
   lines.push(`  Port:          ${port}`);
+  if (publicUrl) lines.push(`  Public URL:    ${publicUrl}  (tunnel -> public listener on 127.0.0.1:${cfg.publicPort || '(disabled)'}; check: aistatus public-status)`);
   lines.push(`  Token:         ${token || '(none) -> run: aistatus token --new --hooks-only   then restart the daemon'}`);
   let daemonState;
   try {
@@ -233,21 +396,34 @@ async function remoteSetup({ cfg, port }) {
     if (r.body?.remoteHooks === true) daemonState = 'running, remote hooks enabled';
     else if (r.body?.remoteHooks === false) daemonState = token ? 'running WITHOUT remote hooks -> restart the daemon to load the token' : 'running, remote hooks disabled (no token)';
     else daemonState = 'running an older version without remote hooks -> restart the daemon';
+    if (publicUrl && !r.body?.public?.listening) daemonState += '; public listener NOT running -> see aistatus public-status';
   } catch {
     daemonState = 'not reachable on this port -> start it: aistatus daemon';
   }
   lines.push(`  Daemon:        ${daemonState}`);
-  const cmds = windowsInstallCommands({ host, port, token });
+  const cmds = windowsInstallCommands({ host, port, token, baseUrl: publicUrl });
   lines.push('');
-  lines.push('On the Windows PC (same network), in PowerShell or cmd:');
-  lines.push('  one-line install (fetches the scripts from this Mac\'s daemon):');
-  lines.push(`    ${cmds.oneLine}`);
-  lines.push('  or copy hooks\\aistatus-hook.ps1 and scripts\\install-windows.ps1 from this repo (keep the folder layout) and run:');
-  lines.push(`    ${cmds.fromFiles}`);
+  if (publicUrl) {
+    lines.push(`On the Windows PC, in PowerShell or cmd (hooks go to ${publicUrl}, which works from any network):`);
+    lines.push('  with a copy of hooks\\aistatus-hook.ps1 and scripts\\install-windows.ps1 from this repo (keep the folder layout):');
+    lines.push(`    ${cmds.fromFiles}`);
+    lines.push('  or, while the PC is on the same network as this Mac, the one-line install (it fetches the scripts');
+    lines.push('  from the LAN port; the public URL never serves them):');
+    lines.push(`    ${cmds.oneLine}`);
+    lines.push('  back to the LAN address later: re-run with -MacHost <ip> and without -BaseUrl.');
+  } else {
+    lines.push('On the Windows PC (same network), in PowerShell or cmd:');
+    lines.push('  one-line install (fetches the scripts from this Mac\'s daemon):');
+    lines.push(`    ${cmds.oneLine}`);
+    lines.push('  or copy hooks\\aistatus-hook.ps1 and scripts\\install-windows.ps1 from this repo (keep the folder layout) and run:');
+    lines.push(`    ${cmds.fromFiles}`);
+  }
   lines.push('  optional: -Machine <name> (default: the PC\'s computer name); uninstall: -Uninstall');
   lines.push('  then trust the new hooks once in Codex (/hooks, or the hooks review prompt in the desktop app).');
+  lines.push('  Re-running the installer where the hooks are already installed keeps the same hook entries: no new trust prompt.');
   lines.push('');
-  lines.push('On this Mac: if the macOS firewall is on, allow incoming connections for node.');
+  if (publicUrl) lines.push(`On this Mac: the tunnel must point at the public listener (you run it): tailscale funnel --bg ${cfg.publicPort || 7779}`);
+  else lines.push('On this Mac: if the macOS firewall is on, allow incoming connections for node.');
   console.log(lines.join('\n'));
   if (!token) process.exitCode = 1;
 }
@@ -354,7 +530,13 @@ export async function main(argv = process.argv.slice(2)) {
       return tokenCommand(flags);
 
     case 'remote-setup':
-      return remoteSetup({ cfg, port });
+      return remoteSetup({ cfg, port, flags });
+
+    case 'public-url':
+      return publicUrlCommand(_, flags);
+
+    case 'public-status':
+      return publicStatus({ cfg, port, flags });
 
     case 'help':
     case '--help':

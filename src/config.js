@@ -21,6 +21,14 @@ export const DEFAULT_CONFIG = Object.freeze({
   // Remote `POST /hook/:tool` needs `Authorization: Bearer <hookToken || token>`;
   // with neither configured, remote hook POSTs are refused (403).
   hookToken: null,
+  // Public listener for a reverse proxy / tunnel (e.g. Tailscale Funnel):
+  // always bound to 127.0.0.1, started only when a token is configured, and
+  // every request there needs a Bearer token (reads: `token`; hooks:
+  // `hookToken`, else `token`). Set to false to disable it.
+  publicPort: 7779,
+  // Public base URL that reaches publicPort, e.g. https://mac.tailnet.ts.net
+  // (used by `aistatus remote-setup` / `public-status`; the daemon ignores it).
+  publicUrl: null,
   // Display name of this computer on cards (default: hostname without ".local").
   machine: null,
   codex: {
@@ -84,6 +92,7 @@ export function loadConfig(p = paths()) {
   const cfg = merge(DEFAULT_CONFIG, user);
   if (process.env.AISTATUS_PORT) cfg.port = Number(process.env.AISTATUS_PORT);
   if (process.env.AISTATUS_HOST) cfg.host = process.env.AISTATUS_HOST;
+  if (process.env.AISTATUS_PUBLIC_PORT) cfg.publicPort = process.env.AISTATUS_PUBLIC_PORT === 'off' ? false : Number(process.env.AISTATUS_PUBLIC_PORT);
   if (process.env.AISTATUS_BONJOUR === '0') cfg.bonjour = false;
   if (process.env.AISTATUS_CODEX_SOURCE) cfg.codex = { ...cfg.codex, source: process.env.AISTATUS_CODEX_SOURCE };
   cfg.codex.sessionsDir = cfg.codex.sessionsDir || p.codexSessions;

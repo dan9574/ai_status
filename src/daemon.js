@@ -3,7 +3,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { loadConfig, paths as getPaths, localMachineName } from './config.js';
 import { SessionStore } from './store.js';
-import { createServer } from './server.js';
+import { createServer, createPublicServer, publicListenerPlan } from './server.js';
 import { advertise } from './bonjour.js';
 import { CodexWatcher } from './codex-watcher.js';
 
@@ -24,7 +24,7 @@ export function saveStateSync(file, data) {
 }
 
 /**
- * Start the daemon. Resolves to { server, store, port, stop() }.
+ * Start the daemon. Resolves to { server, store, port, publicServer, publicPort, stop() }.
  * opts may override config fields (port, host, bonjour, codex...).
  */
 export async function startDaemon(opts = {}) {
@@ -54,7 +54,14 @@ export async function startDaemon(opts = {}) {
     if (!saveTimer) saveTimer = setTimeout(saveNow, 200);
   });
 
-  const server = createServer({ store, config, log });
+  // Public listener (for a tunnel such as Tailscale Funnel): 127.0.0.1 only,
+  // token required on every route. Not started without a token.
+  const plan = publicListenerPlan(config);
+  let publicServer = null;
+  let publicPort = null;
+  const publicStatus = () => ({ public: { listening: !!publicServer, port: publicPort, read: plan.read, hook: plan.hook } });
+
+  const server = createServer({ store, config, log, status: publicStatus });
   await new Promise((resolve, reject) => {
     server.once('error', reject);
     server.listen(config.port, config.host, resolve);
@@ -63,6 +70,24 @@ export async function startDaemon(opts = {}) {
   log(`aistatusd listening on http://${config.host}:${port} as "${machine}" (state: ${p.stateFile})`);
   const remoteHooks = config.hookToken || config.token;
   log(remoteHooks ? 'remote hooks: enabled (Bearer token required)' : 'remote hooks: disabled (no token configured)');
+
+  if (plan.enabled) {
+    const srv = createPublicServer({ store, config, log, limits: opts.publicLimits });
+    try {
+      await new Promise((resolve, reject) => {
+        srv.once('error', reject);
+        srv.listen(plan.port, '127.0.0.1', resolve);
+      });
+      publicServer = srv;
+      publicPort = srv.address().port;
+      log(`public listener on http://127.0.0.1:${publicPort} (token required on every route; reads: ${plan.read ? 'on' : 'off, no "token"'}, hooks: ${plan.hook ? 'on' : 'off'})`);
+    } catch (e) {
+      await srv.closeAll();
+      log(`public listener NOT started: cannot listen on 127.0.0.1:${plan.port} (${e.code || e.message})`);
+    }
+  } else {
+    log(`public listener not started: ${plan.reason}`);
+  }
 
   const bonjour = config.bonjour ? advertise({ port, log }) : null;
 
@@ -88,11 +113,12 @@ export async function startDaemon(opts = {}) {
     watcher?.stop();
     bonjour?.stop();
     await server.closeAll();
+    await publicServer?.closeAll();
     saveNow();
     log('aistatusd stopped');
   };
 
-  return { server, store, port, config, machine, stop };
+  return { server, store, port, config, machine, stop, publicServer, publicPort };
 }
 
 /** Run in the foreground until SIGINT/SIGTERM. */

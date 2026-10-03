@@ -20,7 +20,7 @@ import { fileURLToPath } from 'node:url';
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const PORT = Number(process.argv[2] || 17790);
 const HOME = fs.mkdtempSync(path.join(os.tmpdir(), 'aistatus-e2e-remote-'));
-const env = { ...process.env, HOME, AISTATUS_PORT: String(PORT), AISTATUS_BONJOUR: '0', AISTATUS_CODEX_SOURCE: 'hooks' };
+const env = { ...process.env, HOME, AISTATUS_PORT: String(PORT), AISTATUS_BONJOUR: '0', AISTATUS_PUBLIC_PORT: 'off', AISTATUS_CODEX_SOURCE: 'hooks' };
 delete env.AISTATUS_DIR;
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 let failures = 0;
