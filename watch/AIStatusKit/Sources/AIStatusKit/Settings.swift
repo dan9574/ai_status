@@ -7,14 +7,24 @@ public enum SettingsKeys {
     public static let token = "daemonToken"
 }
 
-/// Values baked in at build time through Info.plist (see watch/Config/*.xcconfig).
+/// Values baked in at build time through Info.plist (see watch/Config/*.xcconfig,
+/// written by `watch/scripts/generate.sh --host … --token …`). They are the
+/// defaults until the user edits the field in Settings.
 public enum BuildDefaults {
-    /// Info.plist `AIStatusDefaultHost` = `$(AISTATUS_DEFAULT_HOST)`, e.g. "Daniels-MacBook-Air.local".
-    public static var host: String {
-        clean(Bundle.main.object(forInfoDictionaryKey: "AIStatusDefaultHost") as? String)
-    }
+    public static let hostKey = "AIStatusDefaultHost"
+    public static let tokenKey = "AIStatusDefaultToken"
 
-    static func clean(_ value: String?) -> String {
+    /// Info.plist `AIStatusDefaultHost` = `$(AISTATUS_DEFAULT_HOST)`, e.g.
+    /// "Daniels-MacBook-Air.local" or "https://mac.tailnet.ts.net".
+    public static var host: String { host(in: Bundle.main.infoDictionary) }
+    /// Info.plist `AIStatusDefaultToken` = `$(AISTATUS_DEFAULT_TOKEN)`: the daemon's
+    /// read token, so it does not have to be typed on the watch.
+    public static var token: String { token(in: Bundle.main.infoDictionary) }
+
+    public static func host(in info: [String: Any]?) -> String { clean(info?[hostKey] as? String) }
+    public static func token(in info: [String: Any]?) -> String { clean(info?[tokenKey] as? String) }
+
+    public static func clean(_ value: String?) -> String {
         let v = value?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
         return v.contains("$(") ? "" : v // unexpanded build setting
     }

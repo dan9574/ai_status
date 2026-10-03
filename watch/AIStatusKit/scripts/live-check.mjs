@@ -17,7 +17,7 @@ const ROOT = path.resolve(PKG, '..', '..');
 const PORT = Number(process.argv[2] || 17780);
 const TOKEN = 'live-token';
 const HOME = fs.mkdtempSync(path.join(os.tmpdir(), 'aistatus-live-'));
-const env = { ...process.env, HOME, AISTATUS_PORT: String(PORT), AISTATUS_BONJOUR: '0', AISTATUS_CODEX_SOURCE: 'hooks' };
+const env = { ...process.env, HOME, AISTATUS_PORT: String(PORT), AISTATUS_BONJOUR: '0', AISTATUS_PUBLIC_PORT: 'off', AISTATUS_CODEX_SOURCE: 'hooks' };
 delete env.AISTATUS_DIR;
 fs.mkdirSync(path.join(HOME, '.aistatus'), { recursive: true });
 fs.writeFileSync(path.join(HOME, '.aistatus', 'config.json'), JSON.stringify({ token: TOKEN }));

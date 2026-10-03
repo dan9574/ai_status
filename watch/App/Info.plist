@@ -41,5 +41,7 @@
 	<string>$(AISTATUS_APP_GROUP)</string>
 	<key>AIStatusDefaultHost</key>
 	<string>$(AISTATUS_DEFAULT_HOST)</string>
+	<key>AIStatusDefaultToken</key>
+	<string>$(AISTATUS_DEFAULT_TOKEN)</string>
 </dict>
 </plist>

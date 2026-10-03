@@ -6,7 +6,7 @@ import SwiftUI
 public struct SettingsView: View {
     @AppStorage(SettingsKeys.host) private var host = BuildDefaults.host
     @AppStorage(SettingsKeys.port) private var port = DaemonEndpoint.defaultPort
-    @AppStorage(SettingsKeys.token) private var token = ""
+    @AppStorage(SettingsKeys.token) private var token = BuildDefaults.token
     @State private var testResult: String?
     @State private var testing = false
 
@@ -19,7 +19,7 @@ public struct SettingsView: View {
     public var body: some View {
         Form {
             Section {
-                TextField("Mac name or IP", text: $host)
+                TextField("Mac name, IP or https URL", text: $host)
                     .autocorrectionDisabled()
                     #if os(watchOS) || os(iOS)
                     .textInputAutocapitalization(.never)
@@ -37,9 +37,15 @@ public struct SettingsView: View {
             }
 
             let fallback = BuildDefaults.host
+            let builtInToken = BuildDefaults.token
             if !fallback.isEmpty, host != fallback {
                 Section {
                     Button("Use \(fallback)") { host = fallback }
+                }
+            }
+            if !builtInToken.isEmpty, token != builtInToken {
+                Section {
+                    Button("Use built-in token") { token = builtInToken }
                 }
             }
 
@@ -52,7 +58,7 @@ public struct SettingsView: View {
                         .foregroundStyle(.secondary)
                 }
             } footer: {
-                Text("On the Mac: `scutil --get LocalHostName` shows the name; run `aistatus daemon`. Watch and Mac must be on the same network.")
+                Text("On the Mac: `scutil --get LocalHostName` shows the name; run `aistatus daemon`. Watch and Mac must be on the same network, or use the Mac's public https URL (`aistatus public-status`).")
             }
         }
         .navigationTitle("Settings")

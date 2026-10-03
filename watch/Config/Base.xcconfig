@@ -6,8 +6,13 @@
 BUNDLE_ID_PREFIX = com.example
 // App Group shared by the app and the widget (counts for the complication).
 AISTATUS_APP_GROUP = group.$(BUNDLE_ID_PREFIX).aistatus
-// Pre-filled daemon host on first launch, e.g. Daniels-MacBook-Air.local
+// Pre-filled daemon host on first launch, e.g. Daniels-MacBook-Air.local or a
+// public https URL. "//" starts a comment in xcconfig files, so a URL must be
+// written as https:/$()/$()host (scripts/generate.sh --host does that for you).
 AISTATUS_DEFAULT_HOST =
+// Pre-filled daemon read token (`aistatus token --read`), so it need not be typed
+// on the watch. Set it only in Local.xcconfig (gitignored): generate.sh --token.
+AISTATUS_DEFAULT_TOKEN =
 // Your (personal) team id. Leave empty and pick the team in Xcode, or set it in Local.xcconfig.
 DEVELOPMENT_TEAM =
 

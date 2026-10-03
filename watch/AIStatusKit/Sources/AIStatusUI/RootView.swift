@@ -11,7 +11,7 @@ public struct AIStatusRootView: View {
     @StateObject private var model: StatusModel
     @AppStorage(SettingsKeys.host) private var host = BuildDefaults.host
     @AppStorage(SettingsKeys.port) private var port = DaemonEndpoint.defaultPort
-    @AppStorage(SettingsKeys.token) private var token = ""
+    @AppStorage(SettingsKeys.token) private var token = BuildDefaults.token
     @Environment(\.scenePhase) private var scenePhase
     @State private var showSettings = false
 

@@ -272,6 +272,52 @@ func runEndpointChecks() {
         check(v6.sessionsURL?.absoluteString.contains("[fe80::1]") == true, "IPv6 URL string bracketed: \(v6.sessionsURL?.absoluteString ?? "nil")")
     }
 
+    suite("endpoint: https base URL (public tunnel, e.g. Tailscale Funnel)") {
+        let ep = DaemonEndpoint(host: "https://mac.tail1234.ts.net", port: 7778, token: "tok")!
+        check(ep.secure, "https:// => secure")
+        expectEqual(ep.host, "mac.tail1234.ts.net", "host without scheme")
+        expectEqual(ep.port, 443, "https without a port => 443 (port setting ignored)")
+        expectEqual(ep.scheme, "https", "scheme")
+        expectEqual(ep.baseURLString, "https://mac.tail1234.ts.net", "base URL without :443")
+        expectEqual(ep.sessionsURL?.absoluteString, "https://mac.tail1234.ts.net/sessions", "sessions URL")
+        expectEqual(ep.eventsURL?.absoluteString, "https://mac.tail1234.ts.net/events", "events URL")
+        expectEqual(ep.healthURL?.absoluteString, "https://mac.tail1234.ts.net/health", "health URL")
+        expectEqual(ep.dismissURL(id: "codex@WIN:a")?.absoluteString, "https://mac.tail1234.ts.net/sessions/codex%40WIN%3Aa/dismiss", "dismiss URL")
+        expectEqual(DaemonEndpoint(host: "  HTTPS://mac.tail1234.ts.net/  ")?.baseURLString, "https://mac.tail1234.ts.net", "case-insensitive scheme, trailing slash, spaces")
+        expectEqual(DaemonEndpoint(host: "https://mac.tail1234.ts.net/sessions?x=1")?.sessionsURL?.absoluteString, "https://mac.tail1234.ts.net/sessions", "path/query stripped")
+        let p8443 = DaemonEndpoint(host: "https://mac.tail1234.ts.net:8443")!
+        expectEqual(p8443.port, 8443, "explicit https port kept")
+        expectEqual(p8443.sessionsURL?.absoluteString, "https://mac.tail1234.ts.net:8443/sessions", "explicit port in URL")
+        expectEqual(DaemonEndpoint(host: "https://mac.tail1234.ts.net:443")?.sessionsURL?.absoluteString, "https://mac.tail1234.ts.net/sessions", "explicit :443 dropped from URL")
+        let http = DaemonEndpoint(host: "http://mymac.local", port: 7790)!
+        check(!http.secure, "http:// stays plain http")
+        expectEqual(http.port, 7790, "http:// without port keeps the port setting")
+        check(!DaemonEndpoint(host: "mac.tail1234.ts.net")!.secure, "no scheme => plain http (LAN / tailnet)")
+        expectEqual(DaemonEndpoint(host: "mac.tail1234.ts.net")!.port, 7778, "no scheme => port setting")
+        expectEqual(DaemonEndpoint(host: "https://dummy.example.ts.net", token: "  t0k  ")?.token, "t0k", "token trimmed for https too")
+        check(DaemonEndpoint(host: "https://") == nil, "scheme only => nil")
+        check(DaemonEndpoint(host: "https://a.ts.net") != DaemonEndpoint(host: "http://a.ts.net", port: 443), "http and https endpoints differ (reconnect on change)")
+        let v6 = DaemonEndpoint(host: "https://[fd7a::1]")!
+        expectEqual(v6.sessionsURL?.absoluteString, "https://[fd7a::1]/sessions", "https IPv6")
+    }
+
+    suite("build-time defaults (Info.plist via xcconfig)") {
+        let info: [String: Any] = ["AIStatusDefaultHost": " https://dummy.example.ts.net ", "AIStatusDefaultToken": "dummy-token-0123456789"]
+        expectEqual(BuildDefaults.host(in: info), "https://dummy.example.ts.net", "host read and trimmed")
+        expectEqual(BuildDefaults.token(in: info), "dummy-token-0123456789", "token read")
+        let unexpanded: [String: Any] = ["AIStatusDefaultHost": "$(AISTATUS_DEFAULT_HOST)", "AIStatusDefaultToken": "$(AISTATUS_DEFAULT_TOKEN)"]
+        expectEqual(BuildDefaults.host(in: unexpanded), "", "unexpanded host => empty")
+        expectEqual(BuildDefaults.token(in: unexpanded), "", "unexpanded token => empty")
+        expectEqual(BuildDefaults.token(in: ["AIStatusDefaultToken": ""]), "", "empty token")
+        expectEqual(BuildDefaults.host(in: nil), "", "no Info.plist")
+        expectEqual(BuildDefaults.token(in: [:]), "", "missing key")
+        let ep = DaemonEndpoint(host: BuildDefaults.host(in: info), port: DaemonEndpoint.defaultPort, token: BuildDefaults.token(in: info))
+        expectEqual(ep?.baseURLString, "https://dummy.example.ts.net", "build defaults make an https endpoint")
+        expectEqual(ep?.token, "dummy-token-0123456789", "with the built-in token")
+        // The xcconfig escape used by scripts/generate.sh: "/" -> "/$()" ("//" is a comment in xcconfig).
+        expectEqual("https:/$()/$()dummy.example.ts.net".replacingOccurrences(of: "$()", with: ""), "https://dummy.example.ts.net", "escape round-trips")
+    }
+
     suite("backoff") {
         let b = Backoff()
         expectEqual((0..<7).map { b.delay(attempt: $0, unit: 0.5) }, [1, 2, 4, 8, 16, 30, 30], "exponential, capped at 30 s")

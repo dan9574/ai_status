@@ -18,7 +18,7 @@ const OUT = path.resolve(HERE, '..', 'Fixtures');
 const PORT = Number(process.argv[2] || 17779);
 const TOKEN = 'fixture-token';
 const HOME = fs.mkdtempSync(path.join(os.tmpdir(), 'aistatus-fixtures-'));
-const env = { ...process.env, HOME, AISTATUS_PORT: String(PORT), AISTATUS_BONJOUR: '0', AISTATUS_CODEX_SOURCE: 'hooks' };
+const env = { ...process.env, HOME, AISTATUS_PORT: String(PORT), AISTATUS_BONJOUR: '0', AISTATUS_PUBLIC_PORT: 'off', AISTATUS_CODEX_SOURCE: 'hooks' };
 delete env.AISTATUS_DIR;
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
