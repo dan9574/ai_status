@@ -3,6 +3,7 @@
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import crypto from 'node:crypto';
 
 export const VERSION = '0.1.0';
 
@@ -14,7 +15,14 @@ export const DEFAULT_CONFIG = Object.freeze({
   bonjour: true,
   // Optional shared secret. When set, non-loopback clients (the watch) must send
   // `Authorization: Bearer <token>` or `?token=<token>`. Loopback is always allowed.
+  // It also enables hook ingestion from other computers (see hookToken).
   token: null,
+  // Optional secret for remote hook senders only (e.g. a Windows PC running Codex).
+  // Remote `POST /hook/:tool` needs `Authorization: Bearer <hookToken || token>`;
+  // with neither configured, remote hook POSTs are refused (403).
+  hookToken: null,
+  // Display name of this computer on cards (default: hostname without ".local").
+  machine: null,
   codex: {
     // "auto": hooks preferred, rollout watcher as fallback; "hooks": hooks only;
     // "watcher": rollout watcher only.
@@ -24,6 +32,10 @@ export const DEFAULT_CONFIG = Object.freeze({
   },
   // Idle (hidden) sessions with no events for this long are forgotten.
   idlePruneHours: 24,
+  // A run whose main turn stopped while sub-agents were still active stays
+  // running until they finish; after this many minutes without any event it is
+  // marked done anyway (guards against a lost SubagentStop).
+  subagentTimeoutMin: 30,
 });
 
 export function homeDir() {
@@ -76,4 +88,64 @@ export function loadConfig(p = paths()) {
   if (process.env.AISTATUS_CODEX_SOURCE) cfg.codex = { ...cfg.codex, source: process.env.AISTATUS_CODEX_SOURCE };
   cfg.codex.sessionsDir = cfg.codex.sessionsDir || p.codexSessions;
   return cfg;
+}
+
+/**
+ * Sanitise a machine display name: letters, digits, '.', '_' and '-' only
+ * (anything else becomes '-'), at most 32 characters. Returns null if empty.
+ */
+export function sanitizeMachine(name) {
+  if (name == null) return null;
+  const s = String(name)
+    .normalize('NFC')
+    .replace(/[^\p{L}\p{N}._-]+/gu, '-')
+    .replace(/-{2,}/g, '-')
+    .replace(/^[-.]+|[-.]+$/g, '');
+  const out = [...s].slice(0, 32).join('').replace(/[-.]+$/, '');
+  return out || null;
+}
+
+/** Name of this computer as shown on cards: config.machine, else the hostname without ".local". */
+export function localMachineName(cfg = {}) {
+  return sanitizeMachine(cfg.machine) || sanitizeMachine(os.hostname().replace(/\.local\.?$/i, '').split('.')[0]) || 'mac';
+}
+
+/** Token that remote hook senders must present, or null when remote hooks are disabled. */
+export function hookTokenOf(cfg = {}) {
+  return cfg.hookToken || cfg.token || null;
+}
+
+export function generateToken() {
+  return crypto.randomBytes(24).toString('base64url');
+}
+
+/** Constant-time string comparison (hashing first so lengths never leak). */
+export function safeEqual(a, b) {
+  if (typeof a !== 'string' || typeof b !== 'string' || !a || !b) return false;
+  const ha = crypto.createHash('sha256').update(a).digest();
+  const hb = crypto.createHash('sha256').update(b).digest();
+  return crypto.timingSafeEqual(ha, hb);
+}
+
+/**
+ * Merge `patch` into the user's raw config.json (not the defaults) and write it
+ * atomically with mode 0600 (it may hold a token). Refuses to touch invalid JSON.
+ */
+export function updateUserConfig(patch, p = paths()) {
+  let user = {};
+  try {
+    const raw = fs.readFileSync(p.configFile, 'utf8');
+    if (raw.trim()) user = JSON.parse(raw);
+  } catch (e) {
+    if (e.code !== 'ENOENT') throw new Error(`${p.configFile} is not valid JSON (${e.message}); refusing to modify it`);
+  }
+  if (!isObj(user)) throw new Error(`${p.configFile} is not a JSON object; refusing to modify it`);
+  const next = { ...user, ...patch };
+  for (const [k, v] of Object.entries(patch)) if (v === undefined) delete next[k];
+  fs.mkdirSync(p.dataDir, { recursive: true });
+  const tmp = `${p.configFile}.${process.pid}.tmp`;
+  fs.writeFileSync(tmp, JSON.stringify(next, null, 2) + '\n', { mode: 0o600 });
+  fs.renameSync(tmp, p.configFile);
+  fs.chmodSync(p.configFile, 0o600);
+  return next;
 }

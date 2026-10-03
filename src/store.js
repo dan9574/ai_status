@@ -1,10 +1,16 @@
 // Session state machine (see PLAN.md "状态机").
 //
-// A session is keyed by `${tool}:${sessionId}`. Hook payloads are first
-// normalised (normalizeHook) into a small set of event types, then applied by
-// SessionStore.apply(). The store emits 'change' after every real mutation.
+// A session is keyed by `${tool}:${sessionId}` for this computer and by
+// `${tool}@${machine}:${sessionId}` for sessions reported by another computer
+// (remote hooks), so equal session ids from two machines never collide.
+// Hook payloads are first normalised (normalizeHook) into a small set of event
+// types, then applied by SessionStore.apply(). The store emits 'change' after
+// every real mutation.
+//
+// Sub-agents: SubagentStart/SubagentStop maintain a per-session set of active
+// sub-agent ids. A Stop that arrives while sub-agents are still active keeps
+// the card running (`pendingStop`); it becomes done when the last one stops.
 import { EventEmitter } from 'node:events';
-import path from 'node:path';
 
 export const TOOLS = ['claude', 'codex'];
 export const STATUS_ORDER = { waiting: 0, running: 1, done: 2, idle: 3 };
@@ -12,6 +18,16 @@ export const STATUS_ORDER = { waiting: 0, running: 1, done: 2, idle: 3 };
 // A "done" session that sees tool activity within this window is treated as a
 // continuation of the same run (e.g. a Stop hook that told the agent to keep going).
 const CONTINUATION_MS = 30_000;
+// A session waiting on sub-agents with no events at all for this long is
+// finalised anyway (guards against a lost SubagentStop).
+export const DEFAULT_SUBAGENT_TIMEOUT_MS = 30 * 60_000;
+
+/** Last path component of a POSIX or Windows path (`C:\\x\\proj` -> `proj`). */
+export function projectName(cwd) {
+  if (!cwd) return null;
+  const parts = String(cwd).split(/[\\/]+/).filter(Boolean);
+  return parts.length ? parts[parts.length - 1] : String(cwd);
+}
 
 export function snippet(text, max = 160) {
   if (text == null) return null;
@@ -44,6 +60,8 @@ export function normalizeHook(tool, payload) {
     via: 'hook',
     hook: name,
   };
+  // Present on events fired inside a sub-agent (Claude Code) and on Subagent* events.
+  if (payload.agent_id != null && payload.agent_id !== '') base.agentId = String(payload.agent_id);
   switch (name) {
     case 'SessionStart':
       return { ...base, type: 'start' };
@@ -80,6 +98,10 @@ export function normalizeHook(tool, payload) {
       return { ...base, type: 'stop', error: payload.error || payload.error_type || 'error', message: payload.error_message || payload.message };
     case 'Interrupt': // Codex: user interrupted the turn
       return { ...base, type: 'stop', interrupted: true };
+    case 'SubagentStart':
+      return base.agentId ? { ...base, type: 'subStart' } : null;
+    case 'SubagentStop':
+      return base.agentId ? { ...base, type: 'subStop' } : null;
     case 'SessionEnd':
       return { ...base, type: 'end', reason: payload.reason };
     default:
@@ -88,29 +110,42 @@ export function normalizeHook(tool, payload) {
 }
 
 export class SessionStore extends EventEmitter {
-  constructor({ swipeThresholdSec = 60, now = () => Date.now() } = {}) {
+  /**
+   * machine: display name of this computer (local sessions).
+   * subagentTimeoutMs: see DEFAULT_SUBAGENT_TIMEOUT_MS.
+   */
+  constructor({ swipeThresholdSec = 60, now = () => Date.now(), machine = 'local', subagentTimeoutMs = DEFAULT_SUBAGENT_TIMEOUT_MS } = {}) {
     super();
     this.swipeThresholdSec = swipeThresholdSec;
     this.now = now;
+    this.machine = machine;
+    this.subagentTimeoutMs = subagentTimeoutMs;
     this.sessions = new Map();
   }
 
   _hookOwnsTranscript(p) {
-    for (const s of this.sessions.values()) if (s.via === 'hook' && s.transcriptPath === p) return true;
+    for (const s of this.sessions.values()) if (!s.remote && s.via === 'hook' && s.transcriptPath === p) return true;
     return false;
   }
 
-  key(tool, sessionId) {
-    return `${tool}:${sessionId}`;
+  /** Session key. `remoteMachine` is set only for sessions reported by another computer. */
+  key(tool, sessionId, remoteMachine = null) {
+    return remoteMachine ? `${tool}@${remoteMachine}:${sessionId}` : `${tool}:${sessionId}`;
+  }
+
+  _keyOf(ev) {
+    return this.key(ev.tool, ev.sessionId, ev.remote ? ev.machine : null);
   }
 
   _create(ev, now) {
     const s = {
-      id: this.key(ev.tool, ev.sessionId),
+      id: this._keyOf(ev),
       tool: ev.tool,
       sessionId: ev.sessionId,
+      machine: ev.remote ? ev.machine : this.machine,
+      remote: !!ev.remote,
       cwd: ev.cwd || null,
-      project: ev.cwd ? path.basename(ev.cwd) : null,
+      project: projectName(ev.cwd),
       status: 'idle',
       startedAt: null,
       startedAtApprox: false,
@@ -124,9 +159,12 @@ export class SessionStore extends EventEmitter {
       error: null,
       ended: false,
       dismissedAt: null,
+      subagents: [],
+      pendingStop: false,
       via: ev.via || 'hook',
       createdAt: now,
       updatedAt: now,
+      lastEventAt: now,
     };
     this.sessions.set(s.id, s);
     return s;
@@ -144,13 +182,23 @@ export class SessionStore extends EventEmitter {
     s.error = null;
     s.ended = false;
     s.dismissedAt = null;
+    s.subagents = [];
+    s.pendingStop = false;
+  }
+
+  _finish(s, at) {
+    s.status = 'done';
+    s.finishedAt = at;
+    s.runDurationMs = s.startedAt != null ? Math.max(0, at - s.startedAt) : null;
+    s.pendingStop = false;
   }
 
   /** Apply a normalised event. Returns true if state changed. */
   apply(ev) {
     if (!ev || !TOOLS.includes(ev.tool) || !ev.sessionId) return false;
+    if (ev.remote && !ev.machine) return false;
     const now = ev.ts ?? this.now();
-    const id = this.key(ev.tool, ev.sessionId);
+    const id = this._keyOf(ev);
     let s = this.sessions.get(id);
 
     let removedDup = false;
@@ -161,7 +209,7 @@ export class SessionStore extends EventEmitter {
       if (ev.transcriptPath && this._hookOwnsTranscript(ev.transcriptPath)) return false;
       // Replayed / stale lines (e.g. after a daemon restart) must not undo a dismiss.
       if (s && ev.ts != null && (ev.ts < s.updatedAt || (s.dismissedAt && ev.ts <= s.dismissedAt))) return false;
-    } else if (ev.transcriptPath) {
+    } else if (ev.transcriptPath && !ev.remote) {
       // A hook arrived for a rollout file the watcher was tracking under
       // another id: drop the watcher's duplicate card.
       for (const [k, o] of this.sessions) {
@@ -172,13 +220,15 @@ export class SessionStore extends EventEmitter {
       }
     }
 
-    if (ev.type === 'end' && !s) return false;
+    if ((ev.type === 'end' || ev.type === 'subStop') && !s) return false;
     const isNew = !s;
     if (!s) s = this._create(ev, now);
-    const before = JSON.stringify(s);
+    if (!Array.isArray(s.subagents)) s.subagents = [];
+    const before = fingerprint(s);
+    s.lastEventAt = Math.max(s.lastEventAt ?? 0, now);
     if (ev.cwd && ev.cwd !== s.cwd) {
       s.cwd = ev.cwd;
-      s.project = path.basename(ev.cwd);
+      s.project = projectName(ev.cwd);
     }
     if (ev.via === 'hook') s.via = 'hook';
     if (ev.transcriptPath) s.transcriptPath = ev.transcriptPath;
@@ -191,6 +241,10 @@ export class SessionStore extends EventEmitter {
       case 'prompt':
         if (s.status === 'idle' || s.status === 'done') this._startRun(s, now, false);
         else s.status = 'running';
+        // A new prompt starts a new turn: forget sub-agents of the previous one
+        // (also recovers from a lost SubagentStop).
+        s.subagents = [];
+        s.pendingStop = false;
         s.waitingSince = null;
         s.waitingReason = null;
         s.dismissedAt = null;
@@ -208,30 +262,38 @@ export class SessionStore extends EventEmitter {
         s.lastMessage = snippet(ev.message) ?? s.lastMessage;
         break;
 
-      case 'activity':
-        if (s.status === 'waiting') {
-          s.status = 'running';
+      case 'subStart':
+        if (!s.subagents.includes(ev.agentId)) s.subagents.push(ev.agentId);
+        // A sub-agent starting is activity of this session.
+        this._activity(s, now);
+        break;
+
+      case 'subStop': {
+        const i = s.subagents.indexOf(ev.agentId);
+        if (i < 0) break; // unknown (e.g. after a new prompt reset the list)
+        s.subagents.splice(i, 1);
+        if (s.subagents.length === 0 && s.pendingStop && (s.status === 'running' || s.status === 'waiting')) {
+          this._finish(s, now);
           s.waitingSince = null;
           s.waitingReason = null;
-        } else if (s.status === 'idle') {
-          if (!s.dismissedAt) this._startRun(s, now, true);
-        } else if (s.status === 'done') {
-          if (s.finishedAt != null && now - s.finishedAt <= CONTINUATION_MS && s.startedAt != null) {
-            // continuation of the same run
-            s.status = 'running';
-            s.finishedAt = null;
-            s.runDurationMs = null;
-          } else {
-            this._startRun(s, now, true);
-          }
         }
+        break;
+      }
+
+      case 'activity':
+        // Tool calls inside a sub-agent never resurrect a finished/dismissed run.
+        if (ev.agentId && (s.status === 'done' || s.status === 'idle')) break;
+        this._activity(s, now);
         break;
 
       case 'stop':
-        if (s.status === 'running' || s.status === 'waiting') {
-          s.status = 'done';
-          s.finishedAt = now;
-          s.runDurationMs = s.startedAt != null ? Math.max(0, now - s.startedAt) : null;
+        if (ev.interrupted || ev.error) s.subagents = []; // the turn was aborted
+        if (s.subagents.length && (s.status === 'running' || s.status === 'waiting')) {
+          // Main turn finished but sub-agents are still working: stay running.
+          s.status = 'running';
+          s.pendingStop = true;
+        } else if (s.status === 'running' || s.status === 'waiting') {
+          this._finish(s, now);
         } else if (s.status === 'idle') {
           if (s.dismissedAt) break;
           // Finished a run we never saw start: show it, duration unknown.
@@ -239,6 +301,7 @@ export class SessionStore extends EventEmitter {
           s.finishedAt = now;
           s.startedAt = null;
           s.runDurationMs = null;
+          s.subagents = [];
         }
         s.waitingSince = null;
         s.waitingReason = null;
@@ -248,6 +311,8 @@ export class SessionStore extends EventEmitter {
         break;
 
       case 'end':
+        s.subagents = [];
+        if (s.pendingStop && (s.status === 'running' || s.status === 'waiting')) this._finish(s, now);
         if (s.status === 'done') s.ended = true;
         else {
           this.sessions.delete(id);
@@ -261,10 +326,29 @@ export class SessionStore extends EventEmitter {
         return false;
     }
 
-    if (JSON.stringify(s) === before && !isNew && !removedDup) return false;
+    if (fingerprint(s) === before && !isNew && !removedDup) return false;
     s.updatedAt = now;
     this.emit('change');
     return true;
+  }
+
+  _activity(s, now) {
+    if (s.status === 'waiting') {
+      s.status = 'running';
+      s.waitingSince = null;
+      s.waitingReason = null;
+    } else if (s.status === 'idle') {
+      if (!s.dismissedAt) this._startRun(s, now, true);
+    } else if (s.status === 'done') {
+      if (s.finishedAt != null && now - s.finishedAt <= CONTINUATION_MS && s.startedAt != null) {
+        // continuation of the same run
+        s.status = 'running';
+        s.finishedAt = null;
+        s.runDurationMs = null;
+      } else {
+        this._startRun(s, now, true);
+      }
+    }
   }
 
   /** Resolve an id: exact `tool:sessionId`, exact sessionId, or unique prefix. */
@@ -289,6 +373,8 @@ export class SessionStore extends EventEmitter {
       s.dismissedAt = this.now();
       s.waitingSince = null;
       s.waitingReason = null;
+      s.subagents = [];
+      s.pendingStop = false;
       s.updatedAt = this.now();
     }
     this.emit('change');
@@ -306,6 +392,7 @@ export class SessionStore extends EventEmitter {
       id: s.id,
       tool: s.tool,
       sessionId: s.sessionId,
+      machine: s.machine ?? this.machine,
       project: s.project,
       cwd: s.cwd,
       status: s.status,
@@ -320,6 +407,8 @@ export class SessionStore extends EventEmitter {
       interrupted: s.interrupted,
       error: s.error,
       ended: s.ended,
+      // Sub-agents still running (the card stays running until they finish).
+      activeSubagents: Array.isArray(s.subagents) ? s.subagents.length : 0,
       updatedAt: s.updatedAt,
     };
   }
@@ -361,15 +450,60 @@ export class SessionStore extends EventEmitter {
     return changed;
   }
 
-  toJSON() {
-    return { version: 1, sessions: [...this.sessions.values()] };
+  /**
+   * Guard against a lost SubagentStop: a session with active sub-agents and no
+   * events at all for subagentTimeoutMs forgets them; if its main turn had
+   * already stopped it becomes done as of its last event.
+   */
+  expireSubagents() {
+    const cutoff = this.now() - this.subagentTimeoutMs;
+    let changed = false;
+    for (const s of this.sessions.values()) {
+      if (!Array.isArray(s.subagents) || !s.subagents.length) continue;
+      const last = s.lastEventAt ?? s.updatedAt ?? 0;
+      if (last > cutoff) continue;
+      s.subagents = [];
+      if (s.pendingStop && (s.status === 'running' || s.status === 'waiting')) {
+        this._finish(s, last);
+        s.waitingSince = null;
+        s.waitingReason = null;
+      }
+      s.pendingStop = false;
+      s.updatedAt = this.now();
+      changed = true;
+    }
+    if (changed) this.emit('change');
+    return changed;
   }
 
+  toJSON() {
+    return { version: 2, sessions: [...this.sessions.values()] };
+  }
+
+  /**
+   * Load persisted state. Accepts the phase-1/2 format (version 1: no machine,
+   * remote, subagents or pendingStop fields): such sessions are local.
+   */
   load(data) {
     this.sessions.clear();
     if (!data || !Array.isArray(data.sessions)) return;
-    for (const s of data.sessions) {
-      if (s && s.id && TOOLS.includes(s.tool) && s.sessionId) this.sessions.set(s.id, s);
+    for (const raw of data.sessions) {
+      if (!raw || typeof raw !== 'object' || !raw.id || !TOOLS.includes(raw.tool) || !raw.sessionId) continue;
+      const s = { ...raw };
+      s.remote = s.remote === true && typeof s.machine === 'string' && s.machine !== '';
+      if (!s.remote) s.machine = this.machine; // local sessions follow this computer's current name
+      s.sessionId = String(s.sessionId);
+      s.id = this.key(s.tool, s.sessionId, s.remote ? s.machine : null);
+      if (!Array.isArray(s.subagents)) s.subagents = [];
+      s.pendingStop = s.pendingStop === true;
+      if (s.lastEventAt == null) s.lastEventAt = s.updatedAt ?? null;
+      this.sessions.set(s.id, s);
     }
   }
+}
+
+// Change detection ignores lastEventAt, which moves on every event (liveness only).
+function fingerprint(s) {
+  const { lastEventAt, ...rest } = s;
+  return JSON.stringify(rest);
 }

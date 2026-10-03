@@ -207,3 +207,160 @@ test('state persists across restart', async () => {
   const s = await req('GET', '/sessions');
   assert.equal(s.body.sessions.find((x) => x.id === 'claude:persist-1').status, 'running');
 });
+
+// ---------------------------------------------------------------- remote hooks
+
+const remotePayload = (sid, ev, extra = {}) => ({ session_id: sid, cwd: 'C:\\Users\\dan\\projects\\winproj', hook_event_name: ev, ...extra });
+
+async function withTokens({ token = null, hookToken = null }, fn) {
+  const prev = { token: d.config.token, hookToken: d.config.hookToken };
+  Object.assign(d.config, { token, hookToken });
+  try {
+    await fn();
+  } finally {
+    Object.assign(d.config, prev);
+  }
+}
+
+test('remote hooks: refused (403) when no token is configured', async (t) => {
+  const ip = lanAddress();
+  if (!ip) return t.skip('no non-loopback IPv4 interface');
+  await withTokens({}, async () => {
+    const r = await req('POST', '/hook/codex?machine=WIN', { host: ip, body: remotePayload('r0', 'UserPromptSubmit'), headers: { Authorization: 'Bearer anything' } });
+    assert.equal(r.status, 403);
+    assert.match(r.body.error, /token/);
+  });
+  assert.ok(!(await req('GET', '/sessions')).body.sessions.some((s) => s.sessionId === 'r0'));
+});
+
+test('remote hooks: token required, wrong token or ?token= rejected, Bearer accepted', async (t) => {
+  const ip = lanAddress();
+  if (!ip) return t.skip('no non-loopback IPv4 interface');
+  await withTokens({ token: 'tok-123' }, async () => {
+    const p = remotePayload('r1', 'UserPromptSubmit', { prompt: 'from windows' });
+    assert.equal((await req('POST', '/hook/codex?machine=WIN', { host: ip, body: p })).status, 401, 'no token');
+    assert.equal((await req('POST', '/hook/codex?machine=WIN', { host: ip, body: p, headers: { Authorization: 'Bearer tok-12' } })).status, 401, 'prefix of token');
+    assert.equal((await req('POST', '/hook/codex?machine=WIN', { host: ip, body: p, headers: { Authorization: 'Bearer tok-1234' } })).status, 401, 'longer token');
+    assert.equal((await req('POST', '/hook/codex?machine=WIN', { host: ip, body: p, headers: { Authorization: 'Basic tok-123' } })).status, 401, 'wrong scheme');
+    assert.equal((await req('POST', '/hook/codex?machine=WIN&token=tok-123', { host: ip, body: p })).status, 401, 'query token not accepted for hooks');
+    const ok = await req('POST', '/hook/codex?machine=WIN', { host: ip, body: p, headers: { Authorization: 'Bearer tok-123' } });
+    assert.equal(ok.status, 200);
+    assert.equal(ok.body.event, 'prompt');
+    assert.equal((await req('GET', '/hook/codex', { host: ip, headers: { Authorization: 'Bearer tok-123' } })).status, 405);
+    assert.equal((await req('POST', '/hook/gemini', { host: ip, body: p, headers: { Authorization: 'Bearer tok-123' } })).status, 404);
+  });
+  const c = (await req('GET', '/sessions')).body.sessions.find((s) => s.sessionId === 'r1');
+  assert.equal(c.id, 'codex@WIN:r1');
+  assert.equal(c.machine, 'WIN');
+  assert.equal(c.project, 'winproj', 'Windows cwd basename');
+  assert.equal(c.status, 'running');
+});
+
+test('remote hooks: hookToken guards hooks only and takes precedence over token', async (t) => {
+  const ip = lanAddress();
+  if (!ip) return t.skip('no non-loopback IPv4 interface');
+  await withTokens({ hookToken: 'hook-only' }, async () => {
+    const p = remotePayload('r2', 'SessionStart');
+    assert.equal((await req('POST', '/hook/codex', { host: ip, body: p, headers: { Authorization: 'Bearer hook-only' } })).status, 200);
+    assert.equal((await req('GET', '/sessions', { host: ip })).status, 200, 'reads stay open without "token"');
+  });
+  await withTokens({ token: 'shared', hookToken: 'hook-only' }, async () => {
+    const p = remotePayload('r2', 'SessionStart');
+    assert.equal((await req('POST', '/hook/codex', { host: ip, body: p, headers: { Authorization: 'Bearer shared' } })).status, 401);
+    assert.equal((await req('GET', '/sessions', { host: ip, headers: { Authorization: 'Bearer shared' } })).status, 200);
+  });
+});
+
+test('remote hooks: machine from ?machine=, X-AIStatus-Machine, else the sender IP; sanitised', async (t) => {
+  const ip = lanAddress();
+  if (!ip) return t.skip('no non-loopback IPv4 interface');
+  const auth = { Authorization: 'Bearer tk' };
+  await withTokens({ token: 'tk' }, async () => {
+    await req('POST', `/hook/codex?machine=${encodeURIComponent('../Dan\'s PC:1/x')}`, { host: ip, body: remotePayload('m1', 'UserPromptSubmit'), headers: auth });
+    await req('POST', '/hook/codex', { host: ip, body: remotePayload('m2', 'UserPromptSubmit'), headers: { ...auth, 'X-AIStatus-Machine': 'Office Box' } });
+    await req('POST', '/hook/codex', { host: ip, body: remotePayload('m3', 'UserPromptSubmit'), headers: auth });
+    await req('POST', `/hook/codex?machine=${'y'.repeat(200)}`, { host: ip, body: remotePayload('m4', 'UserPromptSubmit'), headers: auth });
+  });
+  const all = (await req('GET', '/sessions')).body.sessions;
+  const m = (sid) => all.find((s) => s.sessionId === sid);
+  assert.equal(m('m1').machine, 'Dan-s-PC-1-x');
+  assert.equal(m('m1').id, 'codex@Dan-s-PC-1-x:m1');
+  assert.equal(m('m2').machine, 'Office-Box');
+  assert.equal(m('m3').machine, ip, 'falls back to the sender IP');
+  assert.equal(m('m4').machine.length, 32);
+  // dismiss a remote card by its full id (as the watch does, percent-encoded)
+  const r = await req('POST', `/sessions/${encodeURIComponent(m('m1').id)}/dismiss`);
+  assert.equal(r.status, 200);
+});
+
+test('remote hooks: same session id on two machines gives two cards; loopback ignores ?machine=', async (t) => {
+  const ip = lanAddress();
+  if (!ip) return t.skip('no non-loopback IPv4 interface');
+  await req('POST', '/hook/codex?machine=SPOOF', { body: remotePayload('dup-1', 'UserPromptSubmit') }); // loopback
+  await withTokens({ token: 'tk' }, async () => {
+    await req('POST', '/hook/codex?machine=WIN', { host: ip, body: remotePayload('dup-1', 'UserPromptSubmit'), headers: { Authorization: 'Bearer tk' } });
+    await req('POST', '/hook/codex?machine=WIN', { host: ip, body: remotePayload('dup-1', 'Stop', { last_assistant_message: 'win done' }), headers: { Authorization: 'Bearer tk' } });
+  });
+  const cards = (await req('GET', '/sessions')).body.sessions.filter((s) => s.sessionId === 'dup-1');
+  assert.equal(cards.length, 2);
+  const local = cards.find((c) => c.id === 'codex:dup-1');
+  const win = cards.find((c) => c.id === 'codex@WIN:dup-1');
+  assert.equal(local.status, 'running');
+  assert.equal(local.machine, d.machine);
+  assert.equal(win.status, 'done');
+  assert.equal(win.lastMessage, 'win done');
+});
+
+test('setup files are served for the one-line Windows install; health reports machine', async (t) => {
+  const h = await req('GET', '/health');
+  assert.equal(h.body.machine, d.machine);
+  assert.equal(h.body.remoteHooks, false);
+  const ip = lanAddress();
+  if (!ip) return t.skip('no non-loopback IPv4 interface');
+  await withTokens({ token: 'tk' }, async () => {
+    for (const f of ['aistatus-hook.ps1', 'install-windows.ps1']) {
+      const r = await new Promise((resolve, reject) => {
+        http.get({ host: ip, port: d.port, path: `/setup/${f}` }, (res) => {
+          let data = '';
+          res.on('data', (c) => (data += c));
+          res.on('end', () => resolve({ status: res.statusCode, data }));
+        }).on('error', reject);
+      });
+      assert.equal(r.status, 200, f);
+      assert.equal(r.data, fs.readFileSync(path.join(ROOT, f.startsWith('install') ? 'scripts' : 'hooks', f), 'utf8'));
+    }
+    assert.equal((await req('GET', '/setup/..%2Fpackage.json', { host: ip })).status, 401, 'nothing else is public');
+    assert.equal((await req('GET', '/health')).body.remoteHooks, true);
+  });
+});
+
+test('a state.json written by the previous version loads on startup', async () => {
+  await d.stop();
+  const stateFile = path.join(HOME, '.aistatus', 'state.json');
+  fs.writeFileSync(
+    stateFile,
+    JSON.stringify({
+      version: 1,
+      sessions: [
+        {
+          id: 'claude:legacy-1', tool: 'claude', sessionId: 'legacy-1', cwd: '/Users/me/legacy', project: 'legacy', status: 'done',
+          startedAt: Date.now() - 90_000, startedAtApprox: false, finishedAt: Date.now() - 10_000, runDurationMs: 80_000,
+          waitingSince: null, waitingReason: null, lastMessage: 'old', transcriptPath: null, interrupted: false, error: null,
+          ended: false, dismissedAt: null, via: 'hook', createdAt: Date.now() - 90_000, updatedAt: Date.now() - 10_000,
+        },
+      ],
+    }),
+  );
+  d = await startDaemon({ port: 0, bonjour: false, codex: { source: 'hooks' }, log: quiet });
+  const c = (await req('GET', '/sessions')).body.sessions.find((s) => s.id === 'claude:legacy-1');
+  assert.equal(c.status, 'done');
+  assert.equal(c.machine, d.machine);
+  assert.equal(c.dismissPolicy, 'confirm');
+  // and it is saved back in the new format
+  await req('POST', '/hook/claude', { body: { session_id: 'legacy-1', cwd: '/Users/me/legacy', hook_event_name: 'UserPromptSubmit' } });
+  await d.stop();
+  const saved = JSON.parse(fs.readFileSync(stateFile, 'utf8'));
+  assert.equal(saved.version, 2);
+  assert.equal(saved.sessions.find((s) => s.id === 'claude:legacy-1').machine, d.machine);
+  d = await startDaemon({ port: 0, bonjour: false, codex: { source: 'hooks' }, log: quiet });
+});

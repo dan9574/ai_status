@@ -23,18 +23,24 @@ export const CLAUDE_EVENTS = [
   { event: 'PostToolUse', matcher: '*' },
   { event: 'PostToolUseFailure', matcher: '*' },
   { event: 'PermissionDenied', matcher: '*' },
+  // Sub-agents: a Stop while (background) sub-agents are active keeps the card running.
+  { event: 'SubagentStart', matcher: '*' },
+  { event: 'SubagentStop', matcher: '*' },
   { event: 'Stop' },
   { event: 'StopFailure', matcher: '*' },
   { event: 'SessionEnd', matcher: '*' },
 ];
 
 // Codex events (verified against the schemas embedded in codex-cli 0.159.0-alpha
-// and https://developers.openai.com/codex/hooks). Codex: omitted matcher = all.
+// and https://learn.chatgpt.com/docs/hooks). Codex: omitted matcher = all.
+// Keep in sync with $Events in scripts/install-windows.ps1 (checked by a test).
 export const CODEX_EVENTS = [
   { event: 'SessionStart' },
   { event: 'UserPromptSubmit' },
   { event: 'PermissionRequest' },
   { event: 'PostToolUse' },
+  { event: 'SubagentStart' },
+  { event: 'SubagentStop' },
   { event: 'Stop' },
   { event: 'Interrupt' },
   { event: 'SessionEnd' },

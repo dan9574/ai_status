@@ -1,7 +1,7 @@
 // aistatusd: wires together store, persistence, HTTP API, Bonjour and the Codex watcher.
 import fs from 'node:fs';
 import path from 'node:path';
-import { loadConfig, paths as getPaths } from './config.js';
+import { loadConfig, paths as getPaths, localMachineName } from './config.js';
 import { SessionStore } from './store.js';
 import { createServer } from './server.js';
 import { advertise } from './bonjour.js';
@@ -32,7 +32,12 @@ export async function startDaemon(opts = {}) {
   const config = { ...loadConfig(p), ...opts };
   const log = opts.log || ((msg) => console.log(`${new Date().toISOString()} ${msg}`));
 
-  const store = new SessionStore({ swipeThresholdSec: config.swipeThresholdSec });
+  const machine = localMachineName(config);
+  const store = new SessionStore({
+    swipeThresholdSec: config.swipeThresholdSec,
+    machine,
+    subagentTimeoutMs: Math.max(1, Number(config.subagentTimeoutMin) || 30) * 60_000,
+  });
   store.load(loadState(p.stateFile));
 
   let saveTimer = null;
@@ -55,7 +60,9 @@ export async function startDaemon(opts = {}) {
     server.listen(config.port, config.host, resolve);
   });
   const port = server.address().port;
-  log(`aistatusd listening on http://${config.host}:${port} (state: ${p.stateFile})`);
+  log(`aistatusd listening on http://${config.host}:${port} as "${machine}" (state: ${p.stateFile})`);
+  const remoteHooks = config.hookToken || config.token;
+  log(remoteHooks ? 'remote hooks: enabled (Bearer token required)' : 'remote hooks: disabled (no token configured)');
 
   const bonjour = config.bonjour ? advertise({ port, log }) : null;
 
@@ -68,12 +75,16 @@ export async function startDaemon(opts = {}) {
   const pruneTimer = setInterval(() => store.prune(config.idlePruneHours * 3600_000), 10 * 60_000);
   pruneTimer.unref();
   store.prune(config.idlePruneHours * 3600_000);
+  const subagentTimer = setInterval(() => store.expireSubagents(), 60_000);
+  subagentTimer.unref();
+  store.expireSubagents();
 
   let stopped = false;
   const stop = async () => {
     if (stopped) return;
     stopped = true;
     clearInterval(pruneTimer);
+    clearInterval(subagentTimer);
     watcher?.stop();
     bonjour?.stop();
     await server.closeAll();
@@ -81,7 +92,7 @@ export async function startDaemon(opts = {}) {
     log('aistatusd stopped');
   };
 
-  return { server, store, port, config, stop };
+  return { server, store, port, config, machine, stop };
 }
 
 /** Run in the foreground until SIGINT/SIGTERM. */

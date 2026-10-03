@@ -1,13 +1,35 @@
 // HTTP API. See README.md "API" for the contract consumed by the watch app.
+import fs from 'node:fs';
 import http from 'node:http';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { normalizeHook, TOOLS } from './store.js';
-import { VERSION } from './config.js';
+import { VERSION, sanitizeMachine, hookTokenOf, safeEqual } from './config.js';
+
+const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
+// Files a remote (Windows) machine may fetch for a one-line install. No secrets.
+export const SETUP_FILES = {
+  'aistatus-hook.ps1': path.join(REPO_ROOT, 'hooks', 'aistatus-hook.ps1'),
+  'install-windows.ps1': path.join(REPO_ROOT, 'scripts', 'install-windows.ps1'),
+};
 
 const MAX_BODY = 8 * 1024 * 1024; // hook payloads can include large tool output
 
 export function isLoopback(addr) {
   if (!addr) return false;
   return addr === '127.0.0.1' || addr === '::1' || addr === '::ffff:127.0.0.1' || addr.startsWith('127.') || addr.startsWith('::ffff:127.');
+}
+
+function bearerOf(req) {
+  const m = /^Bearer\s+(\S+)\s*$/i.exec(req.headers.authorization || '');
+  return m ? m[1] : null;
+}
+
+/** Display name for a remote hook sender: ?machine= or X-AIStatus-Machine, else its IP. */
+export function remoteMachineName(req, url) {
+  const given = url.searchParams.get('machine') || req.headers['x-aistatus-machine'];
+  const ip = String(req.socket.remoteAddress || '').replace(/^::ffff:/, '');
+  return sanitizeMachine(given) || sanitizeMachine(ip) || 'remote';
 }
 
 function send(res, code, body, headers = {}) {
@@ -60,8 +82,7 @@ export function createServer({ store, config = {}, log = () => {} }) {
 
   const authorized = (req, url) => {
     if (!config.token || isLoopback(req.socket.remoteAddress)) return true;
-    const h = req.headers.authorization || '';
-    return h === `Bearer ${config.token}` || url.searchParams.get('token') === config.token;
+    return safeEqual(bearerOf(req), config.token) || safeEqual(url.searchParams.get('token'), config.token);
   };
 
   const server = http.createServer(async (req, res) => {
@@ -75,9 +96,17 @@ export function createServer({ store, config = {}, log = () => {} }) {
     const remote = req.socket.remoteAddress;
 
     try {
-      // --- hook ingestion: loopback only -------------------------------
+      // --- hook ingestion ------------------------------------------------
+      // Loopback: always accepted (this Mac). Other computers: only when a
+      // token is configured (hookToken || token) and sent as a Bearer header.
       if (parts[0] === 'hook') {
-        if (!isLoopback(remote)) return send(res, 403, { error: 'hooks are accepted from loopback only' });
+        let remoteMachine = null;
+        if (!isLoopback(remote)) {
+          const expected = hookTokenOf(config);
+          if (!expected) return send(res, 403, { error: 'remote hooks are disabled; configure a token on the Mac (aistatus token --new)' });
+          if (!safeEqual(bearerOf(req), expected)) return send(res, 401, { error: 'unauthorized' });
+          remoteMachine = remoteMachineName(req, url);
+        }
         if (req.method !== 'POST') return send(res, 405, { error: 'method not allowed' });
         const tool = parts[1];
         if (!TOOLS.includes(tool) || parts.length !== 2) return send(res, 404, { error: `unknown tool ${tool}` });
@@ -89,9 +118,17 @@ export function createServer({ store, config = {}, log = () => {} }) {
           return send(res, 400, { error: 'invalid json' });
         }
         const ev = normalizeHook(tool, payload);
+        if (ev && remoteMachine) Object.assign(ev, { remote: true, machine: remoteMachine });
         const changed = ev ? store.apply(ev) : false;
-        log(`hook ${tool} ${payload?.hook_event_name} ${String(payload?.session_id || '').slice(0, 8)} -> ${ev ? ev.type : 'ignored'}${changed ? '' : ' (no change)'}`);
+        log(`hook ${tool}${remoteMachine ? `@${remoteMachine}` : ''} ${payload?.hook_event_name} ${String(payload?.session_id || '').slice(0, 8)} -> ${ev ? ev.type : 'ignored'}${changed ? '' : ' (no change)'}`);
         return send(res, 200, { ok: true, event: ev ? ev.type : null, changed });
+      }
+
+      // --- setup files for remote machines (public, no secrets) ----------
+      if (parts[0] === 'setup' && parts.length === 2 && req.method === 'GET' && Object.hasOwn(SETUP_FILES, parts[1])) {
+        const data = fs.readFileSync(SETUP_FILES[parts[1]]);
+        res.writeHead(200, { 'Content-Type': 'text/plain; charset=utf-8', 'Cache-Control': 'no-store', 'Content-Length': data.length });
+        return res.end(data);
       }
 
       if (!authorized(req, url)) return send(res, 401, { error: 'unauthorized' });
@@ -101,6 +138,8 @@ export function createServer({ store, config = {}, log = () => {} }) {
           ok: true,
           name: 'aistatusd',
           version: VERSION,
+          machine: store.machine,
+          remoteHooks: !!hookTokenOf(config),
           pid: process.pid,
           startedAt,
           serverTime: Date.now(),

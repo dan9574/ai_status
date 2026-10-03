@@ -1,6 +1,8 @@
 // `aistatus` command line.
 import http from 'node:http';
-import { loadConfig, paths as getPaths } from './config.js';
+import os from 'node:os';
+import { execFileSync } from 'node:child_process';
+import { loadConfig, paths as getPaths, generateToken, updateUserConfig, hookTokenOf, localMachineName } from './config.js';
 import { renderCards } from './render.js';
 import { installHooks, uninstallHooks, installDaemonPlist } from './installer.js';
 
@@ -15,6 +17,13 @@ Usage:
   aistatus install-hooks [--claude] [--codex] [--port N]
   aistatus uninstall-hooks [--claude] [--codex]
   aistatus install-daemon [--print]   write the launchd plist (does not load it)
+  aistatus token [--new [--hooks-only]]
+                                print the token remote hook senders must use;
+                                --new generates and saves one ("token": also
+                                required from the watch; --hooks-only saves it as
+                                "hookToken", which only guards remote hooks)
+  aistatus remote-setup         values + install command for another computer
+                                (e.g. a Windows PC running Codex)
 
 Options:
   --port N    daemon port (default from ~/.aistatus/config.json, else 7778)
@@ -153,6 +162,96 @@ async function live({ host, port }) {
   draw();
 }
 
+/** Non-internal, non-link-local IPv4 addresses of this Mac. */
+export function lanAddresses() {
+  const out = [];
+  for (const [name, list] of Object.entries(os.networkInterfaces())) {
+    for (const a of list || []) {
+      if (a.family === 'IPv4' && !a.internal && !a.address.startsWith('169.254.')) out.push({ iface: name, address: a.address });
+    }
+  }
+  return out;
+}
+
+function bonjourHostName() {
+  try {
+    return execFileSync('/usr/sbin/scutil', ['--get', 'LocalHostName'], { encoding: 'utf8', timeout: 2000 }).trim() + '.local';
+  } catch {
+    return null;
+  }
+}
+
+function tokenCommand(flags) {
+  const p = getPaths();
+  if (flags.new) {
+    const key = flags['hooks-only'] ? 'hookToken' : 'token';
+    const token = generateToken();
+    updateUserConfig({ [key]: token }, p);
+    console.log(token);
+    console.error(`saved as "${key}" in ${p.configFile} (mode 600). Restart the daemon to apply it.`);
+    if (key === 'token') {
+      console.error('note: "token" also protects reads from other devices: enter it in the watch app settings (Token),');
+      console.error('      or use `aistatus token --new --hooks-only` to protect remote hooks only.');
+    }
+    return;
+  }
+  const t = hookTokenOf(loadConfig(p));
+  if (!t) {
+    console.error('no token configured; remote hooks are disabled. Create one with: aistatus token --new [--hooks-only]');
+    process.exitCode = 1;
+    return;
+  }
+  console.log(t);
+}
+
+export function windowsInstallCommands({ host, port, token, machine }) {
+  const tok = token || '<TOKEN>';
+  const m = machine ? ` -Machine '${machine}'` : '';
+  const url = `http://${host}:${port}/setup/install-windows.ps1`;
+  return {
+    oneLine: `powershell -NoProfile -ExecutionPolicy Bypass -Command "& ([scriptblock]::Create((New-Object Net.WebClient).DownloadString('${url}'))) -MacHost ${host} -Port ${port} -Token '${tok}'${m}"`,
+    fromFiles: `powershell -NoProfile -ExecutionPolicy Bypass -File .\\scripts\\install-windows.ps1 -MacHost ${host} -Port ${port} -Token '${tok}'${m}`,
+  };
+}
+
+async function remoteSetup({ cfg, port }) {
+  const token = hookTokenOf(cfg);
+  const ips = lanAddresses();
+  const host = ips[0]?.address || '<MAC-IP>';
+  const lines = [];
+  lines.push('aistatus remote setup: let another computer (e.g. a Windows PC running Codex) report to this Mac');
+  lines.push('');
+  lines.push(`  This Mac:      ${localMachineName(cfg)}`);
+  lines.push(`  Mac LAN IPs:   ${ips.length ? ips.map((a) => `${a.address} (${a.iface})`).join(', ') : '(none found; connect to the network first)'}`);
+  const bj = bonjourHostName();
+  if (bj) lines.push(`  Bonjour name:  ${bj}  (Windows may not resolve .local names; prefer the IP)`);
+  lines.push(`  Port:          ${port}`);
+  lines.push(`  Token:         ${token || '(none) -> run: aistatus token --new --hooks-only   then restart the daemon'}`);
+  let daemonState;
+  try {
+    const r = await request('GET', { host: '127.0.0.1', port, path: '/health' });
+    if (r.body?.remoteHooks === true) daemonState = 'running, remote hooks enabled';
+    else if (r.body?.remoteHooks === false) daemonState = token ? 'running WITHOUT remote hooks -> restart the daemon to load the token' : 'running, remote hooks disabled (no token)';
+    else daemonState = 'running an older version without remote hooks -> restart the daemon';
+  } catch {
+    daemonState = 'not reachable on this port -> start it: aistatus daemon';
+  }
+  lines.push(`  Daemon:        ${daemonState}`);
+  const cmds = windowsInstallCommands({ host, port, token });
+  lines.push('');
+  lines.push('On the Windows PC (same network), in PowerShell or cmd:');
+  lines.push('  one-line install (fetches the scripts from this Mac\'s daemon):');
+  lines.push(`    ${cmds.oneLine}`);
+  lines.push('  or copy hooks\\aistatus-hook.ps1 and scripts\\install-windows.ps1 from this repo (keep the folder layout) and run:');
+  lines.push(`    ${cmds.fromFiles}`);
+  lines.push('  optional: -Machine <name> (default: the PC\'s computer name); uninstall: -Uninstall');
+  lines.push('  then trust the new hooks once in Codex (/hooks, or the hooks review prompt in the desktop app).');
+  lines.push('');
+  lines.push('On this Mac: if the macOS firewall is on, allow incoming connections for node.');
+  console.log(lines.join('\n'));
+  if (!token) process.exitCode = 1;
+}
+
 export async function main(argv = process.argv.slice(2)) {
   const { _, flags } = parseArgs(argv);
   const cfg = loadConfig(getPaths());
@@ -250,6 +349,12 @@ export async function main(argv = process.argv.slice(2)) {
       console.log(`wrote ${file} (not loaded). To start it now:\n  launchctl bootstrap gui/$(id -u) ${file}\nTo stop/remove:\n  launchctl bootout gui/$(id -u)/com.aistatus.daemon && rm ${file}`);
       return;
     }
+
+    case 'token':
+      return tokenCommand(flags);
+
+    case 'remote-setup':
+      return remoteSetup({ cfg, port });
 
     case 'help':
     case '--help':

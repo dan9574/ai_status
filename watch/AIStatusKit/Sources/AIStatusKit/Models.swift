@@ -144,6 +144,8 @@ public struct SessionCard: Identifiable, Hashable, Sendable, Codable {
     public var error: String?
     public var ended: Bool
     public var updatedAt: Int64?
+    /// Computer the session runs on (daemon >= phase 3; nil from older daemons).
+    public var machine: String?
 
     public init(
         id: String, tool: AgentTool, sessionId: String, project: String? = nil, cwd: String? = nil,
@@ -151,7 +153,7 @@ public struct SessionCard: Identifiable, Hashable, Sendable, Codable {
         finishedAt: Int64? = nil, runDurationMs: Int64? = nil, waitingSince: Int64? = nil,
         waitingReason: WaitingReason? = nil, lastMessage: String? = nil,
         dismissPolicy: DismissPolicy = .confirm, interrupted: Bool = false, error: String? = nil,
-        ended: Bool = false, updatedAt: Int64? = nil
+        ended: Bool = false, updatedAt: Int64? = nil, machine: String? = nil
     ) {
         self.id = id
         self.tool = tool
@@ -171,11 +173,12 @@ public struct SessionCard: Identifiable, Hashable, Sendable, Codable {
         self.error = error
         self.ended = ended
         self.updatedAt = updatedAt
+        self.machine = machine
     }
 
     private enum CodingKeys: String, CodingKey {
         case id, tool, sessionId, project, cwd, status, startedAt, startedAtApprox, finishedAt, runDurationMs
-        case waitingSince, waitingReason, lastMessage, dismissPolicy, interrupted, error, ended, updatedAt
+        case waitingSince, waitingReason, lastMessage, dismissPolicy, interrupted, error, ended, updatedAt, machine
     }
 
     public init(from decoder: Decoder) throws {
@@ -205,6 +208,8 @@ public struct SessionCard: Identifiable, Hashable, Sendable, Codable {
         }
         ended = try c.decodeIfPresent(Bool.self, forKey: .ended) ?? false
         updatedAt = try c.decodeMillisIfPresent(forKey: .updatedAt)
+        // Optional and tolerant: absent, null or non-string => nil.
+        machine = (try? c.decodeIfPresent(String.self, forKey: .machine)) ?? nil
     }
 
     /// Human name for the card: project, else last path component of cwd, else a short session id.

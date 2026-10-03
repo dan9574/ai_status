@@ -1,6 +1,6 @@
 # ai_status · 阶段一：`aistatusd` 守护进程 + `aistatus` 终端查看器；阶段二：watchOS 应用
 
-在本机追踪每个 Claude Code / Codex 会话的实时状态（running / waiting / done），通过局域网 HTTP API 提供给阶段二的 watchOS 应用。Node 22，零 npm 依赖。设计见 [PLAN.md](PLAN.md)。手表应用见下文[阶段二：watchOS 应用](#阶段二watchos-应用)。
+在本机追踪每个 Claude Code / Codex 会话的实时状态（running / waiting / done），通过局域网 HTTP API 提供给阶段二的 watchOS 应用。Node 22，零 npm 依赖。设计见 [PLAN.md](PLAN.md)。手表应用见下文[阶段二：watchOS 应用](#阶段二watchos-应用)。另一台电脑（Windows 上的 Codex 桌面版）也可以把会话汇报给这台 Mac，见[多台电脑（Windows）](#多台电脑windows)。
 
 ## 安装与运行
 
@@ -31,6 +31,8 @@ node bin/aistatus.js                        # 另开终端：实时卡片视图�
 | `aistatus daemon [--port N] [--no-bonjour]` | 前台运行守护进程 |
 | `aistatus install-hooks` / `uninstall-hooks` | 安装 / 卸载钩子 |
 | `aistatus install-daemon [--print]` | 生成 launchd plist（不加载） |
+| `aistatus token [--new [--hooks-only]]` | 打印远程钩子要用的 token；`--new` 生成并保存（见[多台电脑](#多台电脑windows)） |
+| `aistatus remote-setup` | 打印另一台电脑需要的全部信息：Mac 局域网 IP、端口、token、Windows 安装命令 |
 
 ### 配置 `~/.aistatus/config.json`（均可省略）
 
@@ -41,16 +43,23 @@ node bin/aistatus.js                        # 另开终端：实时卡片视图�
   "swipeThresholdSec": 60,
   "bonjour": true,
   "token": null,
+  "hookToken": null,
+  "machine": null,
   "codex": { "source": "auto", "pollMs": 1500 },
-  "idlePruneHours": 24
+  "idlePruneHours": 24,
+  "subagentTimeoutMin": 30
 }
 ```
 
 - `swipeThresholdSec`：运行时长低于此值的已完成卡片 `dismissPolicy = "swipe"`，否则 `"confirm"`。
-- `token`：设置后，非本机客户端需带 `Authorization: Bearer <token>` 或 `?token=<token>`；本机永远放行。
+- `token`：设置后，非本机客户端（手表）需带 `Authorization: Bearer <token>` 或 `?token=<token>`；本机永远放行。它同时也允许别的电脑推送钩子（除非另设了 `hookToken`）。
+- `hookToken`：只用于别的电脑推送钩子（`POST /hook/:tool`）。设置后远程钩子必须带它（此时 `token` 不再被远程钩子接受），读取接口不受影响。`token` 和 `hookToken` 都没设时，远程钩子一律 `403`。
+- `machine`：本机在卡片 `machine` 字段里的名字，默认取主机名去掉 `.local`（例如 `DanieldeMacBook-Air-2`）。
+- `subagentTimeoutMin`：主回合已结束、但子代理还在跑的会话保持 running；若这么多分钟内没有任何事件（例如丢了 `SubagentStop`），按最后一次事件的时间记为 done。
 - `codex.source`：`auto`（钩子优先，会话文件监听兜底）/ `hooks` / `watcher`。
 - 环境变量覆盖：`AISTATUS_PORT`、`AISTATUS_HOST`、`AISTATUS_BONJOUR=0`、`AISTATUS_CODEX_SOURCE`、`AISTATUS_DIR`（数据目录）。
-- 状态持久化在 `~/.aistatus/state.json`（原子写入），守护进程重启后卡片不丢。
+- 状态持久化在 `~/.aistatus/state.json`（原子写入），守护进程重启后卡片不丢。旧版本（阶段一/二）写的 state.json 可以直接加载，其中的会话都算本机会话。
+- **升级到这个版本后**：重启守护进程，并重新执行一次 `node bin/aistatus.js install-hooks`，才会装上新增的 `SubagentStart` / `SubagentStop` 钩子（已有条目不变）。Codex 只需要在 `/hooks` 里信任这两条**新增**的条目；已经信任过的条目定义没变，信任仍然有效。
 
 ## 状态机
 
@@ -60,11 +69,15 @@ node bin/aistatus.js                        # 另开终端：实时卡片视图�
 | `UserPromptSubmit` | running，记录 `startedAt`；done 会话重新开始计时 |
 | `Notification`（`permission_prompt`、`elicitation_dialog`、`agent_needs_input`）/ `PermissionRequest` / `PreToolUse(AskUserQuestion)` | waiting |
 | `PostToolUse` / `PostToolUseFailure` / `PermissionDenied`（waiting 之后） | 回到 running |
-| `Stop` / `StopFailure` / Codex `Interrupt` | done，记录 `finishedAt`、`runDurationMs`、最后一条回复摘要 |
+| `SubagentStart` / `SubagentStop`（带 `agent_id`） | 记录 / 移除该会话正在运行的子代理 |
+| `Stop`（仍有子代理在运行，例如后台子代理） | **保持 running**，记下最后一条回复；最后一个 `SubagentStop` 到达时才变 done（`finishedAt` = 那一刻，`runDurationMs` 从 `startedAt` 算起） |
+| `Stop` / `StopFailure` / Codex `Interrupt` | done，记录 `finishedAt`、`runDurationMs`、最后一条回复摘要；`StopFailure` / `Interrupt` 同时清空子代理 |
 | `SessionEnd` | 已 done 的保留卡片（`ended: true`）直到清除，否则删除 |
 | dismiss | 隐藏卡片（会话变 idle；已结束的会话直接删除）。之后同一轮的迟到事件不会让它复活，新的 prompt 会 |
 
 `Notification` 的 `idle_prompt`（完成 60 秒后的“等待输入”提醒）被忽略，不会把 done 变成 waiting。守护进程宕机期间错过开头的会话，收到后续事件时会以 `startedAtApprox: true` 补建卡片。
+
+子代理的防卡死：新的 `UserPromptSubmit` 会清空子代理列表；`SessionEnd` 也会清空（若主回合已结束则记为 done）；子代理内部的工具事件（带 `agent_id`）不会让已经 done 或已清除的卡片复活；若某个 `SubagentStop` 丢了，会话在 `subagentTimeoutMin`（默认 30 分钟）内没有任何事件后自动记为 done。依据：Claude Code 文档说明 `SubagentStart` 对后台子代理也会触发、子代理内的钩子事件带 `agent_id`、`Stop` 只表示主回合回复结束；Codex 文档说明子代理钩子使用父会话的 `session_id` 并带 `agent_id`。Codex 的子代理是否会在 `Stop` 之后继续运行，文档没有说明，逻辑对两者一致。
 
 ## API（供 watchOS 客户端使用）
 
@@ -86,6 +99,7 @@ Bonjour：`_aistatus._tcp`，实例名 `aistatus@<主机名>`，TXT：`path=/ses
       "id": "claude:2f1c…",
       "tool": "claude",
       "sessionId": "2f1c…",
+      "machine": "DanieldeMacBook-Air-2",
       "project": "ai_status",
       "cwd": "/Users/me/projects/ai_status",
       "status": "running",
@@ -100,6 +114,7 @@ Bonjour：`_aistatus._tcp`，实例名 `aistatus@<主机名>`，TXT：`path=/ses
       "interrupted": false,
       "error": null,
       "ended": false,
+      "activeSubagents": 0,
       "updatedAt": 1790959420000
     }
   ]
@@ -108,8 +123,9 @@ Bonjour：`_aistatus._tcp`，实例名 `aistatus@<主机名>`，TXT：`path=/ses
 
 | 字段 | 说明 |
 |---|---|
-| `id` | 卡片主键 `<tool>:<sessionId>`，用于 dismiss |
+| `id` | 卡片主键：本机会话 `<tool>:<sessionId>`，别的电脑的会话 `<tool>@<machine>:<sessionId>`（两台电脑的同一 sessionId 不会冲突）。用于 dismiss，客户端应当把它当作不透明字符串 |
 | `tool` | `claude` \| `codex` |
+| `machine` | 会话所在电脑的名字（本机为 `machine` 配置或主机名；远程为发送方提供的名字，已清洗，≤32 字符）。旧版守护进程没有此字段 |
 | `project` / `cwd` | 工作目录及其 basename |
 | `status` | `running` \| `waiting` \| `done`（idle 不出现在列表里） |
 | `startedAt` | 本轮开始时间；running 显示 `now - startedAt`。done 且开头未知时为 `null` |
@@ -120,6 +136,7 @@ Bonjour：`_aistatus._tcp`，实例名 `aistatus@<主机名>`，TXT：`path=/ses
 | `dismissPolicy` | `swipe`（短任务，可直接滑掉）\| `confirm`（需确认）。非 done 卡片一律 `confirm` |
 | `interrupted` / `error` | 被中断 / 以错误结束 |
 | `ended` | 会话进程已退出 |
+| `activeSubagents` | 仍在运行的子代理数（>0 时即使主回合已结束也保持 running） |
 
 排序：waiting → running → done，同组内按开始时间先后。
 
@@ -142,11 +159,20 @@ data: {"version":1,"serverTime":…,"sessions":[…]}
 
 ### `GET /health`
 
-`{"ok":true,"name":"aistatusd","version":"0.1.0","pid":…,"startedAt":…,"serverTime":…,"sessions":3,"sseClients":1}`
+`{"ok":true,"name":"aistatusd","version":"0.1.0","machine":"DanieldeMacBook-Air-2","remoteHooks":false,"pid":…,"startedAt":…,"serverTime":…,"sessions":3,"sseClients":1}`
 
-### `POST /hook/:tool`（仅本机）
+`remoteHooks`：当前进程是否接受别的电脑推送钩子（配置了 `hookToken` 或 `token`）。
 
-`:tool` 为 `claude` 或 `codex`，请求体为钩子原始 JSON。**只接受回环地址**，其他来源返回 `403`。由 `aistatus-hook` 脚本调用，客户端不需要使用。
+### `POST /hook/:tool`
+
+`:tool` 为 `claude` 或 `codex`，请求体为钩子原始 JSON。由钩子转发脚本调用，手表不需要使用。
+
+- **回环地址**（本机 `aistatus-hook`）：永远接受，会话属于本机，`?machine=` 被忽略。
+- **其他地址**（别的电脑）：没有配置 `hookToken`/`token` → `403`；`Authorization: Bearer <hookToken 或 token>` 缺失或不对 → `401`（常数时间比较；钩子**不接受** `?token=`）。通过后，电脑名取 `?machine=<名字>`，其次请求头 `X-AIStatus-Machine`，都没有则用对方 IP；名字只保留字母、数字、`.`、`_`、`-`（其余变 `-`），最长 32 字符。
+
+### `GET /setup/aistatus-hook.ps1`、`GET /setup/install-windows.ps1`
+
+返回仓库里的这两个 PowerShell 脚本（`text/plain`，不需要 token，不含任何秘密），供 Windows 上一行命令安装。
 
 ### 错误与认证
 
@@ -171,9 +197,88 @@ data: {"version":1,"serverTime":…,"sessions":[…]}
 - **用户按 Esc 中断 Claude**：文档中 `Stop` 定义为“Claude 完成回复时”，中断时很可能不触发（未实测），此时卡片会停在 running，直到下一个 prompt 或手动 dismiss。Codex 有 `Interrupt` 钩子，不受影响。
 - 代理进程崩溃/被杀且没有 `Stop`/`SessionEnd` 时，卡片同样会停留，需手动 dismiss。
 - `PostToolUse` 每次工具调用都会触发一次 curl（同步，约 10–45ms）。
-- 默认无认证：局域网内任何人都能读取项目名、路径、消息摘要并 dismiss；在不可信网络请设置 `token`。仅 IPv4 `0.0.0.0` 监听。
+- 默认无认证：局域网内任何人都能读取项目名、路径、消息摘要并 dismiss；在不可信网络请设置 `token`。仅 IPv4 `0.0.0.0` 监听。远程钩子默认关闭，需要 token 才能打开。
 - Codex 钩子与会话文件中的 session id 是否一致未验证（通过 `transcript_path` 去重兜底）；Codex 桌面版里钩子信任界面如何出现未验证。
 - 卡片排序、时间都由服务器给出绝对时间；手表需自行处理时钟偏差（用 `serverTime`）。
+
+## 多台电脑（Windows）
+
+让另一台电脑（例如装了 **Codex 桌面版的 Windows PC**）把它的 Codex 会话汇报给这台 Mac。Mac 是中心：手表仍然只连 Mac，就能同时看到两台电脑的会话。卡片界面上不区分是哪台电脑（JSON 里有 `machine` 字段，只用来保证两台电脑的会话 id 不冲突）。
+
+```
+Windows: Codex ─钩子→ aistatus-hook.ps1 ─HTTP POST（Bearer token）→ Mac: aistatusd ─→ 手表
+```
+
+### 前提
+
+- 两台电脑在**同一个局域网**（同一个 Wi-Fi / 路由器），Windows 能访问 Mac 的 IP。公司网络里如果开了客户端隔离（AP isolation），两台机器互相访问不了，这个功能就用不了。
+- 建议在路由器里给 Mac 固定 IP（DHCP 保留），否则 Mac 的 IP 变了要在 Windows 上重新运行安装脚本（只改配置文件，不需要重新信任钩子）。
+
+### 第一步：Mac 上
+
+```sh
+cd ~/projects/ai_status
+node bin/aistatus.js token --new --hooks-only   # 生成 token，存为 ~/.aistatus/config.json 的 "hookToken"（权限 600）
+# 重启守护进程使其生效（前台运行的：Ctrl-C 后重新 node bin/aistatus.js daemon；
+#   用 launchd 的：launchctl kickstart -k gui/$(id -u)/com.aistatus.daemon）
+node bin/aistatus.js remote-setup                # 打印 Mac 的局域网 IP、端口、token 和 Windows 上要执行的命令
+```
+
+- 推荐 `--hooks-only`：它只保护“别的电脑推送钩子”，手表照常连接、**不用**在手表上输入 token。若改用 `aistatus token --new`（存为 `"token"`），局域网读取也会被保护，那就必须在手表设置里填上这个 token，否则手表显示 token 错误。
+- `remote-setup` 最后一行的 “Daemon:” 会告诉你正在运行的守护进程有没有加载 token（显示 `remote hooks enabled` 才算好）。
+- **macOS 防火墙**：如果开着（系统设置 → 网络 → 防火墙），要允许 `node` 接受传入连接（手表能连上说明已经允许过了）。
+
+### 第二步：Windows 上（PowerShell 或 cmd）
+
+**方式 A：一行命令安装**（脚本从 Mac 的守护进程下载）：把 `remote-setup` 打印的 “one-line install” 那一行原样粘贴执行，形如：
+
+```bat
+powershell -NoProfile -ExecutionPolicy Bypass -Command "& ([scriptblock]::Create((New-Object Net.WebClient).DownloadString('http://192.168.1.20:7778/setup/install-windows.ps1'))) -MacHost 192.168.1.20 -Port 7778 -Token '你的token'"
+```
+
+**方式 B：复制文件**：把仓库里的 `hooks\aistatus-hook.ps1` 和 `scripts\install-windows.ps1` 按原目录结构拷到 Windows（U 盘、共享文件夹或 `git clone` 都行），在仓库目录执行：
+
+```bat
+powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\install-windows.ps1 -MacHost 192.168.1.20 -Port 7778 -Token "你的token"
+```
+
+可选参数：`-Machine 办公室PC`（电脑名，默认是 Windows 的计算机名）、`-SkipTest`（不做连通测试）、`-Uninstall`（卸载）。
+
+安装脚本做的事：
+1. 写 `%USERPROFILE%\.aistatus\config.json`：`{ "host", "port", "token", "machine" }`；
+2. 把转发脚本放到 `%USERPROFILE%\.aistatus\aistatus-hook.ps1`；
+3. 把钩子**合并**进 `%USERPROFILE%\.codex\hooks.json`：先备份到 `%USERPROFILE%\.aistatus\backups\codex-hooks.<时间>.json`；文件不是合法 JSON 时拒绝修改；重复执行无变化；`-Uninstall` 只删除命令里含 `aistatus-hook` 的条目。事件与 Mac 上的 Codex 钩子完全一致：`SessionStart`、`UserPromptSubmit`、`PermissionRequest`、`PostToolUse`、`SubagentStart`、`SubagentStop`、`Stop`、`Interrupt`、`SessionEnd`，`timeout: 3`；
+4. 发一个测试请求（一个不会显示成卡片的 `SessionStart`），告诉你结果：OK / token 不对（401）/ Mac 没开远程钩子（403）/ 连不上（IP、防火墙、守护进程没运行、Mac 睡眠）。
+
+钩子命令是固定的一行（换 IP/端口/token 只改 `config.json`，命令不变，Codex 不会要求重新信任）：
+
+```
+powershell -NoProfile -ExecutionPolicy Bypass -File "C:/Users/<你>/.aistatus/aistatus-hook.ps1"
+```
+
+转发脚本从标准输入读原始字节（不经过控制台代码页，中文不会乱码），POST 到 `http://<Mac>:<端口>/hook/codex?machine=<电脑名>`，带 `Authorization: Bearer <token>`，每一步网络超时 1 秒、不走代理；无论成功失败都**没有任何输出、退出码 0**，不会阻塞或影响 Codex。
+
+### 第三步：在 Codex 里信任钩子（一次）
+
+Codex 对新钩子按定义的哈希做信任校验，未信任的钩子会被跳过（什么也不会发送）。打开 Codex：CLI 里输入 `/hooks` 审核并信任这 9 条 aistatus 钩子；桌面版里在出现钩子审核提示时确认。之后在 Windows 上发一条消息，手表 / `aistatus list` 上应该出现对应的卡片。
+
+### 排查
+
+- 在 Mac 上看日志：远程钩子会记成 `hook codex@<电脑名> UserPromptSubmit …`（前台运行看终端，launchd 看 `~/.aistatus/daemon.log`）。
+- Windows 上重新运行安装脚本即可再做一次连通测试。手动测试：`powershell -NoProfile -Command "Invoke-WebRequest -UseBasicParsing http://<Mac IP>:7778/health"`。
+- `.local` 名字在 Windows 上不一定能解析，`-MacHost` 请用 IP。
+
+### 尚未验证（这里没有 Windows 电脑）
+
+以下内容只做了静态检查（脚本纯 ASCII、事件列表与 Mac 安装器一致的单元测试），**PowerShell 脚本从未实际运行过**（本机也没有 `pwsh`）：
+
+- 两个 `.ps1` 在 Windows PowerShell 5.1 上的语法和行为，包括 `ConvertFrom-Json` / `ConvertTo-Json` 合并 `hooks.json` 的结果（已用 `Remove-TypeData System.Array` 规避 5.1 把数组序列化成 `{"value":…,"Count":…}` 的已知问题；写文件不带 BOM）。
+- Codex 在 Windows 上用什么 shell 执行钩子命令，官方文档没有写（只提到可选的 `commandWindows` 字段）。命令写成在 cmd、PowerShell 和 POSIX shell 里都能解析的形式（路径用正斜杠并加引号），但没实测。如果 Codex 在 WSL 里运行代理，则钩子大概率在 Linux 里执行，这个脚本不适用。
+- Codex 桌面版在 Windows 上的钩子信任界面在哪里出现。
+- 每次钩子都要启动一次 `powershell.exe`（通常几百毫秒），`PostToolUse` 每个工具调用都会触发，Codex 会因此每次多等这么久；`timeout: 3` 内应该足够，但没测过冷启动最慢的情况。没有使用文档里的 `async: true`，因为异步执行可能让事件乱序（例如工具事件晚于 `Stop` 到达）。
+- Windows 上 Codex 钩子 payload 的 `cwd` 是否为 `C:\…` 形式（项目名同时兼容 `\` 和 `/` 两种分隔符）。
+
+已在本机验证（`node scripts/e2e-remote.mjs`）：用 curl 对 Mac 的局域网 IP 发送与 PowerShell 脚本完全相同的请求（同样的 URL、请求头、UTF-8 原始字节），覆盖 403 / 401 / 200、完整的 Codex 回合（含子代理）、中文文本、同一 sessionId 在两台电脑上不冲突、电脑名回退与清洗、手表方式的 dismiss、重启后持久化、Mac 不可达时发送方 1 秒左右放弃，以及一行安装命令要下载的两个脚本。
 
 ## 开发
 
@@ -185,7 +290,10 @@ src/codex-watcher.js  Codex rollout 文件监听
 src/installer.js      钩子安装/卸载、launchd plist
 src/cli.js, render.js 命令行与终端渲染
 hooks/aistatus-hook.sh 钩子转发脚本
+hooks/aistatus-hook.ps1     Windows 钩子转发脚本（PowerShell 5.1）
+scripts/install-windows.ps1 Windows 安装/卸载脚本
 scripts/e2e.mjs       端到端检查（临时 HOME，默认端口 17778）
+scripts/e2e-remote.mjs 远程钩子端到端检查（临时 HOME，默认端口 17790，用 curl 打本机局域网 IP）
 ```
 
 测试与 e2e 只使用临时 HOME，不会修改真实的 `~/.claude`、`~/.codex` 或加载 launchd 任务。

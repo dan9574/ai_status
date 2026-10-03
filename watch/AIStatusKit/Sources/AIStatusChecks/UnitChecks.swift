@@ -71,6 +71,30 @@ func runDecodingChecks() {
         expectEqual(s.sessions[2].displayProject, "repo", "displayProject from cwd")
         check((try? Snapshot.decode(Data("{\"sessions\":[]}".utf8))) == nil, "missing serverTime is an error")
     }
+
+    suite("machine field (multi-host daemon)") {
+        let json = """
+        {"version":1,"serverTime":1791051250000,"sessions":[
+          {"id":"codex@WIN-PC:abc","tool":"codex","sessionId":"abc","machine":"WIN-PC","project":"winproj","status":"running","startedAt":1791051240000,"activeSubagents":1},
+          {"id":"codex:abc","tool":"codex","sessionId":"abc","machine":"my-mac","status":"done","finishedAt":1791051250000},
+          {"id":"claude:x","tool":"claude","sessionId":"x","status":"running"},
+          {"id":"claude:y","tool":"claude","sessionId":"y","machine":null,"status":"running"},
+          {"id":"claude:z","tool":"claude","sessionId":"z","machine":42,"status":"running"}
+        ]}
+        """
+        let s = try Snapshot.decode(Data(json.utf8))
+        expectEqual(s.sessions.count, 5, "all cards decode (unknown activeSubagents ignored)")
+        expectEqual(s.sessions[0].machine, "WIN-PC", "remote machine decoded")
+        expectEqual(s.sessions[0].id, "codex@WIN-PC:abc", "remote id kept verbatim")
+        expectEqual(s.sessions[1].machine, "my-mac", "local machine decoded")
+        check(s.sessions[0].id != s.sessions[1].id, "same sessionId on two machines => distinct ids")
+        expectEqual(s.sessions[2].machine, nil, "older daemon: no machine")
+        expectEqual(s.sessions[3].machine, nil, "null machine")
+        expectEqual(s.sessions[4].machine, nil, "non-string machine tolerated")
+        let re = try JSONDecoder().decode([SessionCard].self, from: JSONEncoder().encode(s.sessions))
+        expectEqual(re, s.sessions, "round trip keeps machine")
+        check(DaemonEndpoint(host: "mac.local")?.dismissURL(id: "codex@WIN-PC:abc")?.absoluteString.hasSuffix("/sessions/codex%40WIN-PC%3Aabc/dismiss") == true, "remote id percent-encoded for dismiss")
+    }
 }
 
 func runSSEChecks() {
