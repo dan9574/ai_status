@@ -1,0 +1,23 @@
+{
+  "ok": true,
+  "dismissed": {
+    "id": "claude:c3d4e5f6-0000-4000-8000-000000quick1",
+    "tool": "claude",
+    "sessionId": "c3d4e5f6-0000-4000-8000-000000quick1",
+    "project": "proj-quick",
+    "cwd": "/Users/demo/projects/proj-quick",
+    "status": "done",
+    "startedAt": 1791051250417,
+    "startedAtApprox": false,
+    "finishedAt": 1791051250719,
+    "runDurationMs": 302,
+    "waitingSince": null,
+    "waitingReason": null,
+    "lastMessage": "It matches ISO-8601 dates.",
+    "dismissPolicy": "swipe",
+    "interrupted": false,
+    "error": null,
+    "ended": false,
+    "updatedAt": 1791051250719
+  }
+}

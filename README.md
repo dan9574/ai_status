@@ -1,6 +1,6 @@
-# ai_status · 阶段一：`aistatusd` 守护进程 + `aistatus` 终端查看器
+# ai_status · 阶段一：`aistatusd` 守护进程 + `aistatus` 终端查看器；阶段二：watchOS 应用
 
-在本机追踪每个 Claude Code / Codex 会话的实时状态（running / waiting / done），通过局域网 HTTP API 提供给阶段二的 watchOS 应用。Node 22，零 npm 依赖。设计见 [PLAN.md](PLAN.md)。
+在本机追踪每个 Claude Code / Codex 会话的实时状态（running / waiting / done），通过局域网 HTTP API 提供给阶段二的 watchOS 应用。Node 22，零 npm 依赖。设计见 [PLAN.md](PLAN.md)。手表应用见下文[阶段二：watchOS 应用](#阶段二watchos-应用)。
 
 ## 安装与运行
 
@@ -189,3 +189,105 @@ scripts/e2e.mjs       端到端检查（临时 HOME，默认端口 17778）
 ```
 
 测试与 e2e 只使用临时 HOME，不会修改真实的 `~/.claude`、`~/.codex` 或加载 launchd 任务。
+
+## 阶段二：watchOS 应用
+
+独立的 watchOS 应用（SwiftUI，**不需要 iPhone 伴侣应用**，部署目标 watchOS 11），外加一个 WidgetKit 小组件（智能叠放 / 表盘复杂功能）。代码在 `watch/`。
+
+> **状态（2026-10-03）**：本机只有命令行工具（Swift 5.10，无 Xcode、无 watchOS SDK）。逻辑和视图都已在 macOS 上编译、测试、离屏渲染，并对真实守护进程跑过联调；但**整个工程从未针对 watchOS SDK 编译过，也从未在手表上运行过**。详见下文“尚未验证”。
+
+### 手表上看到什么
+
+- **每个会话一张卡片**：工具（Claude = 橙色 ✦ sparkle，Codex = 蓝色 `</>`，颜色和图形都不同）、项目名、状态。
+  - running：绿色，“for 12:34” 自走计时（`Text(date, style: .timer)`，不轮询）。
+  - waiting：橙色底 + 橙色描边 + 举手图标，“Needs approval / Has a question / Needs input”，显示已等待多久和等待前跑了多久。
+  - done：“idle 3:02” 自走计时（自 finishedAt 起），外加“ran 4m 10s”（本次运行时长）；被中断显示 Interrupted，出错显示红色 Failed。
+- **只有一个会话**：整屏一张大卡片；向左滑或点 “Clear” 清除。**多个会话**：列表，每行一张卡片，点开看大卡片。
+- **排序（手表专用，与服务器不同）**：waiting（等最久的在前）→ done（最早完成的在前）→ running（最早开始的在前）。
+- **智能清除**：完全按守护进程给的 `dismissPolicy`：`swipe` → 列表里一滑到底直接清除；`confirm` → 滑动后点 Clear，再弹确认框。清除是乐观的（先隐藏，`POST /sessions/:id/dismiss` 失败则恢复并提示；404 视为已清除）。running / waiting 卡片也能清除（总是需要确认），用于处理卡住的会话（见阶段一“已知限制”）。
+- **状态页**：未设置主机 → 引导设置；连接中 → 转圈；连不上 → 红色 “Can't reach Mac”，显示地址、原因（拒绝连接 / 找不到主机 / token 错误…）、最后更新时间和当时的计数，带 Retry；无会话 → “No active sessions”。左上角小圆点：绿 = SSE 实时，黄 = 轮询，红 = 离线。
+- **触感**：应用在前台时，有会话变成 waiting（`.notification`，优先）或 done（`.success`）时震动；打开应用时的第一份快照不震。
+- **设置**：主机、端口（默认 7778）、token（可选），`@AppStorage` 持久化。主机只写名字会自动补 `.local`（`Daniels-MacBook-Air` → `Daniels-MacBook-Air.local`），也接受 IP、`host:port`、带 `http://` 的写法；“Test connection” 调 `/health`。构建时 `generate.sh` 会把本机的 Bonjour 名写进 Info.plist 作为默认主机，**手表上通常不用打字**。
+- **小组件**：`accessoryRectangular / Circular / Inline / Corner`，显示 running / waiting / done 计数和“as of 时间”；数据来自应用最后一次写入 App Group 的快照（计数变化时才刷新时间线）。小组件自己不联网，所以它只和你上次打开应用时一样新（后台刷新是阶段三）。
+
+### 网络
+
+- 前台时用 `URLSession.bytes` 连 `GET /events`（SSE，自己按字节解析，因为 `AsyncBytes.lines` 会吞掉空行）；首个快照 8 秒内没到（例如代理缓冲了流）或连接断开 → 立即 `GET /sessions` 轮询（每 5 秒），同时按指数退避（1→2→4…30 秒，±20% 抖动）重连 SSE；连续 2 次失败才显示离线。SSE 空闲 40 秒（守护进程每 15 秒 ping）视为断线。
+- 应用进入后台（`scenePhase == .background`）即断开；抬腕回来自动重连。
+- 时钟偏差：每份快照的 `serverTime` 与本地收到时刻（轮询取往返中点）求差，取最近 5 个样本的中位数，所有时间戳换算成本地时间再交给计时文本。
+- 没有使用 Bonjour 浏览：普通 watchOS 应用基本拿不到 Network.framework 的 NWBrowser/NWConnection，所以手动主机是基线。
+- Info.plist：`NSAppTransportSecurity → NSAllowsLocalNetworking = YES`（允许明文 HTTP 到 `.local`、不带点的主机名和局域网 IP；**故意没有**加 `NSAllowsArbitraryLoads`，两者同时存在时后者会被忽略）、`NSLocalNetworkUsageDescription`、`NSBonjourServices = _aistatus._tcp`、`WKApplication`、`WKWatchOnly`。
+- 守护进程 API **无需改动**，阶段一的 `/sessions`、`/events`、`/sessions/:id/dismiss`、`/health` 和 Bearer token 已够用。
+
+### 目录
+
+```
+watch/
+  project.yml                 XcodeGen 规格：watchOS 应用 AIStatus + 小组件扩展 AIStatusWidget、App Group
+  Config/Base.xcconfig        包名前缀、App Group、默认主机、团队（可被 Local.xcconfig 覆盖）
+  App/                        @main（只承载 AIStatusRootView）、Info.plist、entitlements、图标
+  Widget/                     WidgetKit 扩展（@main WidgetBundle + TimelineProvider）
+  scripts/generate.sh         写 Config/Local.xcconfig（首次）并运行 xcodegen
+  scripts/check.sh            不需要 Xcode 的全部检查
+  AIStatusKit/                Swift 包（macOS 上可 swift build）
+    Sources/AIStatusKit       模型/解码、SSE 解析、Endpoint、URLSession 传输、连接循环、时钟、排序、视图模型、App Group 存储
+    Sources/AIStatusUI        全部 SwiftUI 视图（watch 专用 API 在 #if os(watchOS) 里）
+    Sources/AIStatusChecks    可执行测试程序（命令行工具里 XCTest 和 Swift Testing 都不可用）
+    Fixtures/                 从真实 aistatusd 抓取的 JSON / SSE 原始字节
+    scripts/capture-fixtures.mjs   重新抓取夹具（临时 HOME、关 Bonjour、端口 17779）
+    scripts/live-check.mjs         对真实守护进程跑 Swift 联调（临时 HOME、端口 17780，中途重启守护进程）
+```
+
+### 现在（无 Xcode）能做的验证
+
+```sh
+cd ~/projects/ai_status/watch
+./scripts/check.sh                              # swift build + 208 项检查 + App/Widget 入口在 macOS 上类型检查 + plist/YAML 语法
+node AIStatusKit/scripts/live-check.mjs         # 再加 32 项：真实 aistatusd 进程上的 SSE、轮询、dismiss、重启重连、局域网 token
+RENDER_DIR=/tmp/aistatus-render AIStatusKit/.build/debug/AIStatusChecks   # 把各个界面渲染成 PNG（macOS 渲染）看一眼
+```
+
+### 装好 Xcode 之后：上手表的步骤
+
+1. **Xcode**：安装后打开一次，同意许可，在 Settings → Components 里安装 **watchOS** 平台。终端执行 `sudo xcode-select -s /Applications/Xcode.app/Contents/Developer`（需要你自己输密码），然后 `xcodebuild -version` 确认。
+2. **XcodeGen**：`brew install xcodegen`（没有 Homebrew 的话，从 https://github.com/yonaskolb/XcodeGen/releases 下载 `xcodegen.zip`，把 `xcodegen` 放进 PATH）。
+3. **生成工程**：
+   ```sh
+   cd ~/projects/ai_status/watch
+   ./scripts/generate.sh                 # 首次会写 Config/Local.xcconfig：
+                                         #   BUNDLE_ID_PREFIX = dev.<你的用户名>
+                                         #   AISTATUS_DEFAULT_HOST = <scutil --get LocalHostName>.local
+   open AIStatus.xcodeproj
+   ```
+   可选：`./scripts/generate.sh --team ABCDE12345 --host my-mac.local --prefix com.yourname`。项目改动只改 `project.yml`，然后重新运行 `generate.sh`（`.xcodeproj` 不入库）。
+4. **签名**：选中 `AIStatus` 目标 → Signing & Capabilities → Team 选你的 Personal Team；`AIStatusWidget` 目标同样操作。若提示包名被占用，用 `--prefix` 换一个前缀重新生成。为了避免每次重新生成都要再选团队，把团队 ID（在 Xcode 选好团队后，Build Settings 里 `DEVELOPMENT_TEAM` 的值）写进去：`./scripts/generate.sh --team <ID>`。
+5. **先在模拟器跑一次**（可选但推荐）：Scheme 选 `AIStatus`，目标选任意 Apple Watch 模拟器，⌘R。模拟器和 Mac 同机，主机填 `localhost` 或 `127.0.0.1` 即可验证界面和网络。
+6. **手表开发者模式**：iPhone 用线连 Mac 并“信任此电脑”；在 Xcode → Window → Devices and Simulators 里能看到配对的手表（首次会花较久“准备设备/拷贝符号”，手表要充电、解锁、靠近 iPhone）。在 iPhone 设置 → 隐私与安全性 → 开发者模式 打开并重启；手表上 设置 → 隐私与安全性 → 开发者模式 打开并重启，按提示确认。
+7. **装到手表**：Scheme `AIStatus`，运行目标选你的 Apple Watch，⌘R。若手表/手机提示不受信任的开发者：iPhone 设置 → 通用 → VPN 与设备管理 → 信任你的开发者证书。
+8. **Mac 端**：`node bin/aistatus.js daemon`（或按阶段一的 launchd 方式常驻）。macOS 防火墙若弹窗，允许 `node` 接受传入连接。先用 iPhone 浏览器打开 `http://<LocalHostName>.local:7778/health` 确认局域网可达。
+9. **手表上**：打开 AI Status。默认主机已是本机名；不对的话点右上角齿轮改主机，点 “Test connection”。如果设置了 `token`，在设置里填上。
+10. **小组件**：长按表盘 → 编辑 → 复杂功能里选 AI Status；或在智能叠放里添加。先打开一次应用，小组件才有数据。
+
+### 尚未验证（因为没有 Xcode / watchOS SDK）
+
+- **从未针对 watchOS SDK 编译过的代码**（macOS 上被 `#if os(watchOS)` 跳过，或只在 watchOS 上有意义）：
+  - `Haptics.swift` 里的 `WKInterfaceDevice.current().play(...)`；
+  - `RootView.swift` 的 `.topBarLeading / .topBarTrailing` 工具栏位置；
+  - `SettingsView.swift` 的 `.textInputAutocapitalization(.never)`；
+  - `WidgetViews.swift` 的 `accessoryCircular / accessoryInline / accessoryCorner` 分支（`AccessoryWidgetBackground`、`.widgetLabel`）；
+  - `Widget/AIStatusWidget.swift` 的 watchOS 小组件家族列表。
+- **全部 Swift 代码**都只用 Swift 5.10 + macOS 14.4 SDK 编译过；Xcode 自带的新编译器（Swift 6.x，工程设为 Swift 5 语言模式）可能报出新的警告或错误。
+- `project.yml` 只做过 YAML 语法检查，**从未用 XcodeGen 生成过**（本机没有 Homebrew/XcodeGen，按要求没有安装）；目标类型、扩展嵌入、包依赖、`#include? "Local.xcconfig"` 等都要在生成时确认。Info.plist / entitlements 只做过 `plutil -lint`。
+- 资源目录（图标、AccentColor）没被 `actool` 编译过。
+- 手表上的实际表现：列表/大卡片排版、滑动清除手势（单卡片页是自定义拖动手势，可能和系统手势冲突，有 Clear 按钮兜底）、确认框、Digital Crown 滚动、常亮显示（AOD）下的计时、触感、小组件外观。
+- 手表上的网络：`URLSession.bytes` 流式 SSE 在手表上（特别是经 iPhone 蓝牙代理时）是否会被缓冲（已做“8 秒没收到首个快照就退回轮询”的兜底）；经代理时 `.local` 名能否解析；本地网络权限提示在 watchOS 上是否出现。
+- Personal Team（免费账号）能否使用 App Group 未确认。如果签名因 App Group 失败：在 `project.yml` 里删掉两个 `CODE_SIGN_ENTITLEMENTS` 行重新生成，应用照常工作，只是小组件会一直显示 “Open the app once”。
+
+### 已知限制
+
+- 只在前台联网：手放下、应用进入后台后不再更新；小组件/复杂功能只显示上次打开应用时的计数；没有通知推送（阶段三）。
+- ATS 只放开本地网络：`xxx.local`、不带点的名字、IP 可以；`mac.lan`、`*.home.arpa` 这类 DNS 名会被拦截，请用 `.local` 名或 IP。若 `.local` 在手表上解析不了，改用 Mac 的局域网 IP（建议在路由器里给 Mac 固定 IP）。
+- 免费 Personal Team 的描述文件 7 天过期，过期后需要从 Xcode 重新安装。
+- token 存在 UserDefaults（`@AppStorage` 要求），不在钥匙串；HTTP 明文，仅适合可信局域网。
+- 手表排序与服务器 `/sessions` 的排序不同（见上文），是有意的。
+- 时钟校正精度约等于局域网单程延迟（毫秒级），对秒级计时足够。

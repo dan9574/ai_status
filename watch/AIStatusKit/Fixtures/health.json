@@ -1,0 +1,10 @@
+{
+  "ok": true,
+  "name": "aistatusd",
+  "version": "0.1.0",
+  "pid": 10920,
+  "startedAt": 1791051247598,
+  "serverTime": 1791051250733,
+  "sessions": 7,
+  "sseClients": 1
+}

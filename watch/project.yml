@@ -1,0 +1,81 @@
+# XcodeGen spec for the standalone watchOS app + WidgetKit extension.
+#   cd watch && ./scripts/generate.sh      (writes Config/Local.xcconfig once, then runs xcodegen)
+# Do not edit the generated AIStatus.xcodeproj by hand; change this file and regenerate.
+name: AIStatus
+options:
+  deploymentTarget:
+    watchOS: "11.0"
+  createIntermediateGroups: true
+  developmentLanguage: en
+configFiles:
+  Debug: Config/Base.xcconfig
+  Release: Config/Base.xcconfig
+settings:
+  base:
+    SWIFT_VERSION: "5.0"            # Swift 5 language mode (no Swift 6 strict-concurrency errors)
+    CODE_SIGN_STYLE: Automatic
+    MARKETING_VERSION: "0.2.0"
+    CURRENT_PROJECT_VERSION: "1"
+    ENABLE_USER_SCRIPT_SANDBOXING: YES
+packages:
+  AIStatusKit:
+    path: AIStatusKit
+targets:
+  AIStatus:
+    type: application
+    platform: watchOS
+    deploymentTarget: "11.0"
+    sources:
+      - path: App
+    dependencies:
+      - package: AIStatusKit
+        product: AIStatusKit
+      - package: AIStatusKit
+        product: AIStatusUI
+      - target: AIStatusWidget
+        embed: true
+        codeSign: true
+    settings:
+      base:
+        PRODUCT_NAME: AIStatus
+        PRODUCT_BUNDLE_IDENTIFIER: $(BUNDLE_ID_PREFIX).aistatus.watchkitapp
+        INFOPLIST_FILE: App/Info.plist
+        GENERATE_INFOPLIST_FILE: YES
+        CODE_SIGN_ENTITLEMENTS: App/AIStatus.entitlements
+        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
+        ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME: AccentColor
+        TARGETED_DEVICE_FAMILY: "4"
+        SKIP_INSTALL: NO
+  AIStatusWidget:
+    type: app-extension
+    platform: watchOS
+    deploymentTarget: "11.0"
+    sources:
+      - path: Widget
+    dependencies:
+      - package: AIStatusKit
+        product: AIStatusKit
+      - package: AIStatusKit
+        product: AIStatusUI
+      - sdk: WidgetKit.framework
+      - sdk: SwiftUI.framework
+    settings:
+      base:
+        PRODUCT_NAME: AIStatusWidget
+        PRODUCT_BUNDLE_IDENTIFIER: $(BUNDLE_ID_PREFIX).aistatus.watchkitapp.widget
+        INFOPLIST_FILE: Widget/Info.plist
+        GENERATE_INFOPLIST_FILE: YES
+        CODE_SIGN_ENTITLEMENTS: Widget/AIStatusWidget.entitlements
+        TARGETED_DEVICE_FAMILY: "4"
+        SKIP_INSTALL: YES
+        LD_RUNPATH_SEARCH_PATHS: "$(inherited) @executable_path/Frameworks @executable_path/../../Frameworks"
+schemes:
+  AIStatus:
+    build:
+      targets:
+        AIStatus: all
+        AIStatusWidget: all
+    run:
+      config: Debug
+    archive:
+      config: Release

@@ -1,0 +1,14 @@
+// Shared build settings for the watch app + widget (referenced by project.yml).
+// Per-machine values live in Local.xcconfig (gitignored), written by
+// scripts/generate.sh. Anything set there overrides the defaults below.
+
+// Must be unique to you when signing with a personal team.
+BUNDLE_ID_PREFIX = com.example
+// App Group shared by the app and the widget (counts for the complication).
+AISTATUS_APP_GROUP = group.$(BUNDLE_ID_PREFIX).aistatus
+// Pre-filled daemon host on first launch, e.g. Daniels-MacBook-Air.local
+AISTATUS_DEFAULT_HOST =
+// Your (personal) team id. Leave empty and pick the team in Xcode, or set it in Local.xcconfig.
+DEVELOPMENT_TEAM =
+
+#include? "Local.xcconfig"
