@@ -2,17 +2,9 @@ import AIStatusKit
 import SwiftUI
 
 extension AgentTool {
-    /// Claude = clay orange with a sparkle, Codex = blue with a code glyph:
-    /// distinguishable by colour *and* shape.
-    public var color: Color {
-        switch self {
-        case .claude: return Color(red: 0.85, green: 0.47, blue: 0.34)
-        case .codex: return Color(red: 0.36, green: 0.62, blue: 1.0)
-        case .other: return .gray
-        }
-    }
-
-    public var symbol: String {
+    /// Tiny tool marker on a tile: Claude = sparkle, Codex = </>. Monochrome so
+    /// it reads on every tile colour; the shape alone tells them apart.
+    var tileSymbol: String {
         switch self {
         case .claude: return "sparkle"
         case .codex: return "chevron.left.forwardslash.chevron.right"
@@ -21,34 +13,46 @@ extension AgentTool {
     }
 }
 
-extension CardPresentation.Tone {
-    public var color: Color {
-        switch self {
-        case .running: return .green
-        case .waiting: return .orange
-        case .done: return Color(red: 0.55, green: 0.6, blue: 0.7)
-        case .failed: return .red
-        case .unknown: return .gray
+/// Colours of one tile. Running = grey (calm), done = green, waiting = orange.
+/// With Always-On (luminance reduced) the fills drop to dark shades and the text
+/// takes the hue, so the screen stays readable without lighting up the wrist.
+struct TileStyle {
+    var fill: Color
+    var text: Color
+    var secondary: Color
+
+    static func of(_ tone: CardPresentation.Tone, dimmed: Bool) -> TileStyle {
+        switch (tone, dimmed) {
+        case (.waiting, false):
+            return TileStyle(fill: Color(red: 1.0, green: 0.58, blue: 0.0), text: .black, secondary: .black.opacity(0.6))
+        case (.waiting, true):
+            return TileStyle(fill: Color(red: 0.30, green: 0.16, blue: 0.0), text: Color(red: 1.0, green: 0.72, blue: 0.4), secondary: Color(red: 1.0, green: 0.72, blue: 0.4).opacity(0.7))
+        case (.done, false), (.failed, false):
+            return TileStyle(fill: Color(red: 0.19, green: 0.78, blue: 0.35), text: .black, secondary: .black.opacity(0.6))
+        case (.done, true), (.failed, true):
+            return TileStyle(fill: Color(red: 0.0, green: 0.22, blue: 0.08), text: Color(red: 0.5, green: 0.92, blue: 0.6), secondary: Color(red: 0.5, green: 0.92, blue: 0.6).opacity(0.7))
+        case (_, false):
+            return TileStyle(fill: Color(white: 0.24), text: .white, secondary: .white.opacity(0.6))
+        case (_, true):
+            return TileStyle(fill: Color(white: 0.11), text: .white.opacity(0.75), secondary: .white.opacity(0.5))
         }
     }
 
-    public var symbol: String {
-        switch self {
-        case .running: return "play.circle.fill"
-        case .waiting: return "exclamationmark.circle.fill"
-        case .done: return "checkmark.circle.fill"
-        case .failed: return "xmark.octagon.fill"
-        case .unknown: return "questionmark.circle"
-        }
+    /// A long-task done tile after the first tap ("tap again to clear").
+    static func armed(dimmed: Bool) -> TileStyle {
+        dimmed
+            ? TileStyle(fill: Color(red: 0.0, green: 0.12, blue: 0.04), text: .white.opacity(0.8), secondary: .white.opacity(0.6))
+            : TileStyle(fill: Color(red: 0.05, green: 0.36, blue: 0.15), text: .white, secondary: .white.opacity(0.75))
     }
 }
 
 extension ConnectionState {
-    var indicatorColor: Color {
+    /// Small indicator over the tiles; nil when everything is fine. Reconnecting
+    /// after a wrist raise (.connecting with data on screen) is not worth a mark.
+    var indicatorColor: Color? {
         switch self {
-        case .live: return .green
+        case .live, .connecting: return nil
         case .polling: return .yellow
-        case .connecting: return .gray
         case .unreachable: return .red
         }
     }

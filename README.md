@@ -302,19 +302,46 @@ scripts/e2e-remote.mjs 远程钩子端到端检查（临时 HOME，默认端口 
 
 独立的 watchOS 应用（SwiftUI，**不需要 iPhone 伴侣应用**，部署目标 watchOS 11），外加一个 WidgetKit 小组件（智能叠放 / 表盘复杂功能）。代码在 `watch/`。
 
-> **状态（2026-10-03）**：本机只有命令行工具（Swift 5.10，无 Xcode、无 watchOS SDK）。逻辑和视图都已在 macOS 上编译、测试、离屏渲染，并对真实守护进程跑过联调；但**整个工程从未针对 watchOS SDK 编译过，也从未在手表上运行过**。详见下文“尚未验证”。
+> **状态（2026-10-03）**：界面已改为“单屏色块”设计（分支 `watch-tiles`，见下文）。用 Xcode 27（Swift 6.4，watchOS 27 SDK）已完成签名的真机构建，macOS 上 386 项检查通过并离屏渲染了 40/44 mm 预览图；**新界面尚未在手表上运行过**（无模拟器运行时）。详见下文“尚未验证”。
 
 ### 手表上看到什么
 
-- **每个会话一张卡片**：工具（Claude = 橙色 ✦ sparkle，Codex = 蓝色 `</>`，颜色和图形都不同）、项目名、状态。
-  - running：绿色，“for 12:34” 自走计时（`Text(date, style: .timer)`，不轮询）。
-  - waiting：橙色底 + 橙色描边 + 举手图标，“Needs approval / Has a question / Needs input”，显示已等待多久和等待前跑了多久。
-  - done：“idle 3:02” 自走计时（自 finishedAt 起），外加“ran 4m 10s”（本次运行时长）；被中断显示 Interrupted，出错显示红色 Failed。
-- **只有一个会话**：整屏一张大卡片；向左滑或点 “Clear” 清除。**多个会话**：列表，每行一张卡片，点开看大卡片。
-- **排序（手表专用，与服务器不同）**：waiting（等最久的在前）→ done（最早完成的在前）→ running（最早开始的在前）。
-- **智能清除**：完全按守护进程给的 `dismissPolicy`：`swipe` → 列表里一滑到底直接清除；`confirm` → 滑动后点 Clear，再弹确认框。清除是乐观的（先隐藏，`POST /sessions/:id/dismiss` 失败则恢复并提示；404 视为已清除）。running / waiting 卡片也能清除（总是需要确认），用于处理卡住的会话（见阶段一“已知限制”）。
-- **状态页**：未设置主机 → 引导设置；连接中 → 转圈；连不上 → 红色 “Can't reach Mac”，显示地址、原因（拒绝连接 / 找不到主机 / token 错误…）、最后更新时间和当时的计数，带 Retry；无会话 → “No active sessions”。左上角小圆点：绿 = SSE 实时，黄 = 轮询，红 = 离线。
-- **触感**：应用在前台时，有会话变成 waiting（`.notification`，优先）或 done（`.success`）时震动；打开应用时的第一份快照不震。
+**只有一屏**：不滚动、没有列表、没有详情页。整个屏幕按会话数切成色块，边到边铺满，色块之间是细黑线：
+
+| 会话数 | 布局 |
+|---|---|
+| 0 | 安静的空状态（“No sessions”，底部一个齿轮按钮） |
+| 1 | 整屏一个色块 |
+| 2 | 横切一刀：上下两行 |
+| 3 | 横切两刀：上中下三行 |
+| 4 | 2×2 田字格 |
+| >4 | 田字格显示最重要的 4 个，左上角小徽标 “+N” 表示还有几个没显示 |
+
+“最重要”的顺序（手表专用，与服务器不同）：waiting（等最久的在前）→ done（完成最早、晾得最久的在前）→ running（开始最早的在前）。行布局从上到下、田字格从左上到右下按此顺序排列。
+
+每个色块**只显示**三样东西：项目名（尽量大，放不下就缩小 / 换行 / 截断）、一个小工具标记（Claude = ✦，Codex = `</>`；不显示是哪台电脑）、一个自走计时器：
+
+- **running → 灰色**，从 `startedAt` 开始正计时；
+- **done → 绿色**，从 `finishedAt` 开始正计时（= 晾了多久；被中断 / 出错的也算 done）；
+- **waiting（等审批 / 输入）→ 橙色**，从 `waitingSince` 开始计时，没有则从 `startedAt`。
+
+计时用 SwiftUI 自走文本（`Text(date, style: .timer)`），不需要网络更新也会一直走。常亮显示（Always-On，`isLuminanceReduced`）时色块变暗、文字取对应颜色，计时改为按分钟显示（`12m`、`1h 05m`，每分钟刷新），因为常亮时屏幕大约一分钟才刷新一次，秒数会停住。
+
+**点按（没有详情页）**：
+
+- 点 **done** 色块：`dismissPolicy = swipe`（短任务）→ 立即清除；`confirm`（长任务）→ 色块变深绿并显示 “✕ Tap again”，3 秒内再点一次才清除，否则自动恢复。同一时间只有一个色块处于“再点一次”状态。
+- 点 running / waiting 色块：什么都不做。
+- 清除走原有的视图模型：先乐观隐藏，`POST /sessions/:id/dismiss` 失败则恢复并弹提示（404 视为已清除）。
+- **长按任意位置 → 设置**（主机 / 端口 / token / Test connection，以表单弹层打开）。空状态、连不上、未设置时屏幕上也有设置按钮。
+
+**连接状态**：有色块时，连接问题只在左上角显示一个小标记（红色 Wi-Fi 叹号 = 连不上，黄点 = SSE 断了在轮询），色块保留最后一次的数据；只有在**没有任何色块可显示**时才整屏显示 “Can't reach Mac”（地址、原因、Retry、齿轮）。首次连接时显示天线图标和主机名；未设置主机时引导去设置。
+
+**触感**：应用在前台时，有会话变成 waiting（`.notification`，优先）或 done（`.success`）时震动；打开应用时的第一份快照不震。长任务第一次点按时轻点一下（`.click`）。
+
+**设为默认屏幕（推荐）**：手表上 设置 → 通用 → 返回时钟（Return to Clock）→ 在应用列表里选 AI Status，打开“返回此应用”（Return to App），并把返回时钟的时间设长一些（选项名以手表系统为准）。这样抬腕时显示的就是这一屏，配合常亮显示随时可看。
+
+预览图（macOS 上离屏渲染，40 mm = 162×197 pt，44 mm = 184×224 pt；右上角的 10:09 和圆角是模拟的系统时钟和屏幕形状）：[`watch/previews/`](watch/previews)，总览见 `overview-40mm.png` / `overview-44mm.png`。
+
 - **设置**：主机、端口（默认 7778）、token（可选），`@AppStorage` 持久化。主机只写名字会自动补 `.local`（`Daniels-MacBook-Air` → `Daniels-MacBook-Air.local`），也接受 IP、`host:port`、带 `http://` 的写法；“Test connection” 调 `/health`。构建时 `generate.sh` 会把本机的 Bonjour 名写进 Info.plist 作为默认主机，**手表上通常不用打字**。
 - **小组件**：`accessoryRectangular / Circular / Inline / Corner`，显示 running / waiting / done 计数和“as of 时间”；数据来自应用最后一次写入 App Group 的快照（计数变化时才刷新时间线）。小组件自己不联网，所以它只和你上次打开应用时一样新（后台刷新是阶段三）。
 
@@ -336,24 +363,32 @@ watch/
   App/                        @main（只承载 AIStatusRootView）、Info.plist、entitlements、图标
   Widget/                     WidgetKit 扩展（@main WidgetBundle + TimelineProvider）
   scripts/generate.sh         写 Config/Local.xcconfig（首次）并运行 xcodegen
-  scripts/check.sh            不需要 Xcode 的全部检查
+  scripts/check.sh            不需要手表的全部检查（macOS 上）
+  previews/                   40/44 mm 离屏渲染预览图（每种会话数、常亮、再点一次、离线、各状态页）
   AIStatusKit/                Swift 包（macOS 上可 swift build）
-    Sources/AIStatusKit       模型/解码、SSE 解析、Endpoint、URLSession 传输、连接循环、时钟、排序、视图模型、App Group 存储
-    Sources/AIStatusUI        全部 SwiftUI 视图（watch 专用 API 在 #if os(watchOS) 里）
+    Sources/AIStatusKit       模型/解码、SSE 解析、Endpoint、URLSession 传输、连接循环、时钟、排序、视图模型、App Group 存储；
+                              Tiles.swift：色块布局（会话数 → 布局、前 4 个 + “+N”、色块几何）、点按清除状态机、常亮时的分钟格式
+    Sources/AIStatusUI        全部 SwiftUI 视图：RootView（单屏 + 设置弹层）、TileBoard（色块）、StateViews（空/连不上/连接中/未设置）、
+                              SettingsView、WidgetViews、Samples（预览数据与渲染目录）；watch 专用 API 在 #if os(watchOS) 里
     Sources/AIStatusChecks    可执行测试程序（命令行工具里 XCTest 和 Swift Testing 都不可用）
     Fixtures/                 从真实 aistatusd 抓取的 JSON / SSE 原始字节
     scripts/capture-fixtures.mjs   重新抓取夹具（临时 HOME、关 Bonjour、端口 17779）
     scripts/live-check.mjs         对真实守护进程跑 Swift 联调（临时 HOME、端口 17780，中途重启守护进程）
 ```
 
-### 现在（无 Xcode）能做的验证
+### 不上手表能做的验证
 
 ```sh
 cd ~/projects/ai_status/watch
-./scripts/check.sh                              # swift build + 208 项检查 + App/Widget 入口在 macOS 上类型检查 + plist/YAML 语法
+./scripts/check.sh                              # swift build + 386 项检查 + App/Widget 入口在 macOS 上类型检查 + plist/YAML 语法
 node AIStatusKit/scripts/live-check.mjs         # 再加 32 项：真实 aistatusd 进程上的 SSE、轮询、dismiss、重启重连、局域网 token
-RENDER_DIR=/tmp/aistatus-render AIStatusKit/.build/debug/AIStatusChecks   # 把各个界面渲染成 PNG（macOS 渲染）看一眼
+RENDER_DIR=previews AIStatusKit/.build/debug/AIStatusChecks   # 重新生成 previews/ 下的预览图（macOS 渲染，计时按“现在”取值）
+# watchOS 真机构建（签名，不安装）：
+xcodebuild -project AIStatus.xcodeproj -scheme AIStatus -destination 'generic/platform=watchOS' \
+  -derivedDataPath DerivedData -allowProvisioningUpdates build
 ```
+
+检查覆盖：会话数 → 布局（0/1/2/3/4/>4）、前 4 个的选择与 “+N”、色块几何（铺满屏幕、文字区在安全区内且大小一致、细分隔线）、点按清除状态机（短任务一点即清、长任务再点一次、3 秒超时恢复、只能有一个待确认、卡片消失/重新运行时取消）、经视图模型的清除（乐观移除）、waiting 计时起点、常亮时的分钟格式，以及所有界面在 40/44 mm 尺寸下的渲染。
 
 ### 装好 Xcode 之后：上手表的步骤
 
@@ -373,21 +408,19 @@ RENDER_DIR=/tmp/aistatus-render AIStatusKit/.build/debug/AIStatusChecks   # 把�
 6. **手表开发者模式**：iPhone 用线连 Mac 并“信任此电脑”；在 Xcode → Window → Devices and Simulators 里能看到配对的手表（首次会花较久“准备设备/拷贝符号”，手表要充电、解锁、靠近 iPhone）。在 iPhone 设置 → 隐私与安全性 → 开发者模式 打开并重启；手表上 设置 → 隐私与安全性 → 开发者模式 打开并重启，按提示确认。
 7. **装到手表**：Scheme `AIStatus`，运行目标选你的 Apple Watch，⌘R。若手表/手机提示不受信任的开发者：iPhone 设置 → 通用 → VPN 与设备管理 → 信任你的开发者证书。
 8. **Mac 端**：`node bin/aistatus.js daemon`（或按阶段一的 launchd 方式常驻）。macOS 防火墙若弹窗，允许 `node` 接受传入连接。先用 iPhone 浏览器打开 `http://<LocalHostName>.local:7778/health` 确认局域网可达。
-9. **手表上**：打开 AI Status。默认主机已是本机名；不对的话点右上角齿轮改主机，点 “Test connection”。如果设置了 `token`，在设置里填上。
-10. **小组件**：长按表盘 → 编辑 → 复杂功能里选 AI Status；或在智能叠放里添加。先打开一次应用，小组件才有数据。
+9. **手表上**：打开 AI Status。默认主机已是本机名；不对的话**长按屏幕**（或在连不上/空状态页点齿轮）打开设置改主机，点 “Test connection”。如果设置了 `token`，在设置里填上。
+10. **设为默认屏幕**：手表 设置 → 通用 → 返回时钟（Return to Clock）→ 选 AI Status，让它保持打开（Return to App）。抬腕即见。
+11. **小组件**：长按表盘 → 编辑 → 复杂功能里选 AI Status；或在智能叠放里添加。先打开一次应用，小组件才有数据。
 
-### 尚未验证（因为没有 Xcode / watchOS SDK）
+### 尚未验证（没有模拟器运行时，也未装到手表）
 
-- **从未针对 watchOS SDK 编译过的代码**（macOS 上被 `#if os(watchOS)` 跳过，或只在 watchOS 上有意义）：
-  - `Haptics.swift` 里的 `WKInterfaceDevice.current().play(...)`；
-  - `RootView.swift` 的 `.topBarLeading / .topBarTrailing` 工具栏位置；
-  - `SettingsView.swift` 的 `.textInputAutocapitalization(.never)`；
-  - `WidgetViews.swift` 的 `accessoryCircular / accessoryInline / accessoryCorner` 分支（`AccessoryWidgetBackground`、`.widgetLabel`）；
-  - `Widget/AIStatusWidget.swift` 的 watchOS 小组件家族列表。
-- **全部 Swift 代码**都只用 Swift 5.10 + macOS 14.4 SDK 编译过；Xcode 自带的新编译器（Swift 6.x，工程设为 Swift 5 语言模式）可能报出新的警告或错误。
-- `project.yml` 只做过 YAML 语法检查，**从未用 XcodeGen 生成过**（本机没有 Homebrew/XcodeGen，按要求没有安装）；目标类型、扩展嵌入、包依赖、`#include? "Local.xcconfig"` 等都要在生成时确认。Info.plist / entitlements 只做过 `plutil -lint`。
-- 资源目录（图标、AccentColor）没被 `actool` 编译过。
-- 手表上的实际表现：列表/大卡片排版、滑动清除手势（单卡片页是自定义拖动手势，可能和系统手势冲突，有 Clear 按钮兜底）、确认框、Digital Crown 滚动、常亮显示（AOD）下的计时、触感、小组件外观。
+- **已验证**：XcodeGen 生成工程；Xcode 27 / watchOS 27 SDK 下 App + 小组件签名真机构建成功，无编译警告（包括 `#if os(watchOS)` 分支：触感、`.textInputAutocapitalization`、小组件家族）；资源目录经 `actool` 编译。
+- **新界面在手表上的实际表现**（预览图是 macOS 渲染，字体度量和控件外观与手表略有不同）：
+  - 系统时钟的位置和顶部安全区：布局按运行时的安全区计算（顶行色块延伸到时钟下方，文字在安全区内），预览里假设 40 mm 顶部 28 pt、44 mm 31 pt，屏幕圆角为估计值；“+N” 和离线标记放在左上角时钟旁边，真机上是否和系统元素冲突待看。
+  - 手势：点按 / 再点一次 / 长按打开设置（`LongPressGesture.exclusively(before: TapGesture)`）的手感和识别、与系统手势是否冲突；设置弹层的关闭按钮。
+  - 触感：`.notification` / `.success` / `.click` 的实际感受。
+  - 常亮显示：`isLuminanceReduced` 下的变暗配色、`TimelineView(.everyMinute)` 的分钟计时是否按预期刷新；正常亮屏时 `Text(.timer)` 的秒级走字。
+  - 色块颜色在 OLED 上的观感、白色系统时钟压在橙/绿色块上的可读性。
 - 手表上的网络：`URLSession.bytes` 流式 SSE 在手表上（特别是经 iPhone 蓝牙代理时）是否会被缓冲（已做“8 秒没收到首个快照就退回轮询”的兜底）；经代理时 `.local` 名能否解析；本地网络权限提示在 watchOS 上是否出现。
 - Personal Team（免费账号）能否使用 App Group 未确认。如果签名因 App Group 失败：在 `project.yml` 里删掉两个 `CODE_SIGN_ENTITLEMENTS` 行重新生成，应用照常工作，只是小组件会一直显示 “Open the app once”。
 
@@ -398,4 +431,6 @@ RENDER_DIR=/tmp/aistatus-render AIStatusKit/.build/debug/AIStatusChecks   # 把�
 - 免费 Personal Team 的描述文件 7 天过期，过期后需要从 Xcode 重新安装。
 - token 存在 UserDefaults（`@AppStorage` 要求），不在钥匙串；HTTP 明文，仅适合可信局域网。
 - 手表排序与服务器 `/sessions` 的排序不同（见上文），是有意的。
+- 超过 4 个会话时只显示最重要的 4 个，其余只计入 “+N”，在手表上看不到也清除不了（等前面的处理掉才会补上来；也可以用 `aistatus dismiss`）。
+- running / waiting 色块在手表上不能清除（点按无反应）；卡住的会话用 Mac 上的 `aistatus dismiss <id>` 清除。
 - 时钟校正精度约等于局域网单程延迟（毫秒级），对秒级计时足够。

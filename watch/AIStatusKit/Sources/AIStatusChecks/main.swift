@@ -19,6 +19,7 @@ runOrderingAndPresentationChecks()
 runEndpointChecks()
 await runFeedChecks()
 await runModelChecks()
+await runTileChecks()
 await runViewSmokeChecks()
 
 if let live = arg("--live") {

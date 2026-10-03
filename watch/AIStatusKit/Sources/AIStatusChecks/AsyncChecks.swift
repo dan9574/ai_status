@@ -198,7 +198,7 @@ func runModelChecks() async {
         try await waitUntil { if case .unreachable = model.connection { return true } else { return false } }
         try await Task.sleep(nanoseconds: 100_000_000)
         expectEqual(model.connection, .unreachable("Connection refused"), "unreachable state (stable)")
-        expectEqual(model.cards.count, 8, "last cards kept for the 'then:' summary")
+        expectEqual(model.cards.count, 8, "last cards kept (tiles stay up with an offline mark)")
         model.start(endpoint: DaemonEndpoint(host: "other-mac"))
         expectEqual(model.cards.count, 0, "endpoint change clears cards")
         check(!model.hasData, "endpoint change clears lastUpdate")
