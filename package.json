@@ -1,0 +1,17 @@
+{
+  "name": "aistatus",
+  "version": "0.1.0",
+  "description": "Live status of Claude Code and Codex sessions (daemon + terminal viewer; watchOS client later)",
+  "type": "module",
+  "private": true,
+  "engines": { "node": ">=22" },
+  "bin": {
+    "aistatus": "bin/aistatus.js",
+    "aistatusd": "bin/aistatusd.js"
+  },
+  "scripts": {
+    "test": "node --test test/*.test.js",
+    "daemon": "node bin/aistatusd.js"
+  },
+  "license": "MIT"
+}
