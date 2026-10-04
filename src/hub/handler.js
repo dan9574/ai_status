@@ -319,7 +319,8 @@ export function createHubHandler(opts = {}) {
 
       return json(404, { error: 'not found' });
     } catch (e) {
-      if (e instanceof HttpError) return json(e.status, { error: e.message }, e.status === 413 ? { Connection: 'close' } : {});
+      // (No hop-by-hop headers such as Connection: the platform owns the connection.)
+      if (e instanceof HttpError) return json(e.status, { error: e.message });
       log(`error ${method} ${String(path).slice(0, 100)}: ${e?.message || e}`);
       return json(500, { error: 'internal error' });
     }

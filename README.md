@@ -1,6 +1,6 @@
 # ai_status · 阶段一：`aistatusd` 守护进程 + `aistatus` 终端查看器；阶段二：watchOS 应用
 
-在本机追踪每个 Claude Code / Codex 会话的实时状态（running / waiting / done），通过局域网 HTTP API 提供给阶段二的 watchOS 应用。Node 22，零 npm 依赖。设计见 [PLAN.md](PLAN.md)。手表应用见下文[阶段二：watchOS 应用](#阶段二watchos-应用)。另一台电脑（Windows 上的 Codex 桌面版）也可以把会话汇报给这台 Mac，见[多台电脑（Windows）](#多台电脑windows)。
+在本机追踪每个 Claude Code / Codex 会话的实时状态（running / waiting / done），通过局域网 HTTP API 提供给阶段二的 watchOS 应用。Node 22，零 npm 依赖。设计见 [PLAN.md](PLAN.md)。手表应用见下文[阶段二：watchOS 应用](#阶段二watchos-应用)。另一台电脑（Windows 上的 Codex 桌面版）也可以把会话汇报给这台 Mac，见[多台电脑（Windows）](#多台电脑windows)。不想让 Mac 一直开着当中心时，可以改用 Supabase 上的云端中转，见[云端中转（Supabase）](#云端中转supabase)。
 
 ## 安装与运行
 
@@ -35,6 +35,8 @@ node bin/aistatus.js                        # 另开终端：实时卡片视图�
 | `aistatus remote-setup [--public-url URL]` | 打印另一台电脑需要的全部信息：Mac 局域网 IP、端口、token、Windows 安装命令；配置了 `publicUrl` 时安装命令改用 `-BaseUrl <公网地址>` |
 | `aistatus public-url [URL \| --clear]` | 查看 / 保存公网地址（例如 `https://danielmacbook-air.tail66228a.ts.net`），只给 CLI 用，守护进程不读 |
 | `aistatus public-status [--show] [--no-probe]` | 公网监听端口是否在运行、token 是否已设置（`--show` 才打印 token 本身）、本机和公网地址的 `/health` 能否访问 |
+| `aistatus cloud setup --url URL --hook-token T [--read-token T] [--machine NAME] [--no-probe]` | 云端模式：钩子改发到云端中转（Supabase Edge Function），见[云端中转](#云端中转supabase) |
+| `aistatus cloud status [--show] [--no-probe]` / `cloud off` / `cloud on` | 云端配置与连通性检查 / 切回本地守护进程 / 切回云端 |
 
 ### 配置 `~/.aistatus/config.json`（均可省略）
 
@@ -188,7 +190,7 @@ data: {"version":1,"serverTime":…,"sessions":[…]}
 
 ## 钩子转发脚本
 
-`hooks/aistatus-hook.sh <claude|codex> [port]`：`curl` 读取 stdin，POST 到 `127.0.0.1`，连接超时 0.5s、总超时 2s，输出全部丢弃，**始终 exit 0**。守护进程未运行时立即返回（实测冷启动首次约 180ms），正常转发实测每次约 10–45ms。Claude 钩子 `timeout: 5`，Codex `timeout: 3`（Codex 的 SessionEnd 上限 3 秒）。
+`hooks/aistatus-hook.sh <claude|codex> [port]`：`curl` 读取 stdin，POST 到 `127.0.0.1`，连接超时 0.5s、总超时 2s，输出全部丢弃，**始终 exit 0**。守护进程未运行时立即返回（实测冷启动首次约 180ms），正常转发实测每次约 10–45ms。Claude 钩子 `timeout: 5`，Codex `timeout: 3`（Codex 的 SessionEnd 上限 3 秒）。存在 `~/.aistatus/cloud.curl` 时（`aistatus cloud setup`）改发到云端中转，并且只发会改变卡片的事件，见[云端中转](#云端中转supabase)。
 
 ## Codex 调查结果（2026-10-02，只读）
 
@@ -368,10 +370,163 @@ Windows ─HTTPS┴→ Tailscale Funnel 中继 ─┘   127.0.0.1/局域网:7778
 - 手表经 iPhone 走 HTTPS 时 SSE 是否被缓冲（已有 8 秒无快照退回轮询的兜底）；Funnel 对长连接的空闲超时（守护进程每 15 秒发心跳）。
 - Windows 上的 `url` / TLS 1.2 分支没有实际运行过（这里没有 Windows / PowerShell）。转发脚本不走系统代理（`Proxy = $null`）；如果学校网络强制走 HTTP 代理才能上外网，钩子会发不出去。
 
+## 云端中转（Supabase）
+
+Mac 当中心有两个问题：Mac 必须一直开着，Tailscale Funnel 隧道不稳定。云端中转把“中心”搬到 Supabase（免费版）的一个 **Edge Function** 上：Mac 和 Windows 的钩子都直接发给它，手表也直接读它，**哪台电脑都不需要一直开着，也不需要隧道**。
+
+```
+Mac 钩子 ──────HTTPS──┐
+Windows 钩子 ──HTTPS──┼→ Edge Function "aistatus" ──→ Postgres 表 aistatus_sessions
+手表（轮询）──HTTPS──┘   https://<ref>.supabase.co/functions/v1/aistatus
+```
+
+- **协议不变**：函数提供和守护进程一样的接口和 JSON（`POST /hook/:tool`、`GET /sessions`、`POST /sessions/:id/dismiss`、`GET /health`），只是都在函数地址下面（`<base>/sessions` 等）。没有 SSE：`GET /events` 返回 `501`，手表就只轮询（见下文）。
+- **状态机是同一份代码**：`src/core.js`（纯 JS，不依赖 Node）同时被守护进程和函数使用；`scripts/build-supabase.mjs` 把它和 `src/hub/*.js` 拼成一个文件 `supabase/functions/aistatus/index.ts`（已提交，测试会检查它和源码一致），在网页编辑器里整个粘贴即可。
+- **每个钩子都是“远程”的**，带电脑名：Mac 上的会话 id 也变成 `claude@<Mac 名>:<id>`（和 Windows 一样）。
+- **token**（函数的 Secrets，至少 16 个字符，常数时间比较，日志里不出现）：
+
+  | Secret | 用途 |
+  |---|---|
+  | `AISTATUS_READ_TOKEN` | 手表 / `aistatus list`：`GET /sessions`、dismiss、完整 `/health` |
+  | `AISTATUS_HOOK_TOKEN` | 钩子：`POST /hook/:tool`（不设时用读取 token；设了之后两者互不通用） |
+  | `AISTATUS_STORE_DETAILS` | 可选，设为 `1` 才保存项目名（只取文件夹名，不存完整路径）和最多 160 字的消息摘要 |
+
+  和公网监听端口一样：`?token=` 无效；未认证的 `GET /health` 只返回 `{"ok":true}`；token 没配置时其他请求返回 `503`。
+- **默认只存最少的数据**：工具、电脑名、会话 id、状态、时间戳、子代理 id。不存路径、提示词、消息、工具输出、错误文本。手表详情页没有项目名时显示电脑名。
+- **并发**：钩子会同时到达（例如几个子代理同时开始）。每个会话一行，带 `version` 列；函数读出 `(state, version)`，在 JS 里跑状态机，再用 `UPDATE … WHERE id = $1 AND version = <读到的值>` 写回（新会话用 `INSERT`，主键冲突即失败）；影响 0 行说明中间有人写过，就从读开始重来（最多 30 次，带抖动退避）。每一步都是一条 SQL 语句，不在 JS 运行期间持有行锁（PostgREST 每个请求是独立事务，`select … for update` 的锁跨不过 JS 那一步；把状态机改写成 plpgsql 又会有两份逻辑）。测试里 12 个并发钩子打同一个会话，一个都不丢；去掉版本检查的对照实验会丢。
+- **表的权限**：开启 RLS 且没有任何策略；`anon` / `authenticated` 角色没有表权限；只有函数用项目的 secret（service_role）key 访问。
+
+### 发送端：只发有用的事件（省调用次数）
+
+免费版每月 50 万次函数调用，每个钩子请求算一次（`401` 也算）。所以云端模式下转发脚本**在本机先过滤**，只发会改变卡片的事件：
+
+| 事件 | 是否发送 |
+|---|---|
+| `SessionStart`、`Notification` 的 `idle_prompt` / `auth_success`、其他未知事件 | 从不发送 |
+| `UserPromptSubmit`、`Stop` / `StopFailure` / `Interrupt`、`SessionEnd`、`SubagentStart` / `SubagentStop`、`PermissionRequest`、权限类 `Notification`、`AskUserQuestion` 的 `PreToolUse` | 发送 |
+| `PostToolUse` 等工具活动 | 只有在本机标记文件（`~/.aistatus/marks/<tool>-<session>`）表明这个会话正在等待（发过权限请求）或刚 `Stop`（可能是继续执行）时才发一次，发完删除标记 |
+
+- 工具活动和超过 256 KiB 的请求只发一个很小的 JSON（会话 id、事件名、`agent_id`、`notification_type`、`tool_name`、`cwd`），工具输出不会离开电脑。
+- Mac（`hooks/aistatus-hook.sh`）和 Windows（`hooks/aistatus-hook.ps1`）用同一张表（测试会对比两边）。Windows 脚本不管发给谁（局域网、Funnel、云端）都这样过滤；Mac 脚本只在云端模式下过滤，本地守护进程模式和以前完全一样。
+- 云端模式下 Mac 钩子同步发送（保证顺序），连接超时 2 秒、总超时 2.5 秒；Windows 每步 1.4 秒。云端不可达时钩子最多拖慢这一次事件，始终 exit 0、没有输出。
+
+**估计用量**（每次 = 一次函数调用）：
+
+| 来源 | 次数 |
+|---|---|
+| 一轮对话（提示 + 完成） | 2 |
+| 一次权限等待（Claude：`PermissionRequest` + 权限 `Notification` + 之后的第一个 `PostToolUse`；Codex 少一次） | 2–3 |
+| 一个子代理（开始 + 结束） | 2 |
+| 一个会话结束 | 1 |
+| 手表亮屏且应用在前台：每 5 秒一次 `GET /sessions`（抬腕回来立即一次） | 12 / 分钟 |
+| 终端实时视图 `aistatus`（云端模式下也是轮询，默认 5 秒） | 12 / 分钟 |
+
+典型的一天：3 个并行会话、150 轮对话、50 次权限等待、30 个子代理 ≈ 300 + 150 + 60 + 20 ≈ **550 次钩子**；手表抬腕 100 次、每次亮屏约 10 秒 ≈ **300 次轮询**。合计约 **1,000 次/天，约 3 万次/月**，是免费额度的 6%。最坏情况：手表应用在前台亮屏 8 小时 ≈ 5,800 次/天，加上钩子也只有约 20 万次/月。数据库只有几十行，流量每月几 MB，远低于免费额度（500 MB 数据库、5 GB 出流量）。
+
+### 手表：只轮询
+
+- 函数的 `GET /events` 返回 `501`：手表第一次连上时试一次 `/events`，之后就只轮询 `GET /sessions`，不再重试 SSE，也**不显示**黄色“轮询中”标记（在云端这是正常状态）。连续 2 次轮询失败才显示离线标记。
+- **只在应用亮屏时轮询**：手腕放下（`.inactive`，常亮显示）时停止，抬腕回到前台立即轮询一次。（连本地守护进程且 SSE 正常时不变：放下手腕也保持连接。）
+- 轮询间隔：手表 设置（长按）→ **Refresh**：3 / 5（默认）/ 10 / 15 / 30 / 60 秒。
+- 地址可以带路径：`https://<ref>.supabase.co/functions/v1/aistatus`，所有请求都在这个路径下面。
+
+### 上线步骤
+
+**A. Supabase 网页上（你来做）**
+
+1. 打开 <https://supabase.com/dashboard>，选一个项目。可以用已有的项目（表名、函数名都带 `aistatus`，不会和别的东西冲突），也可以新建一个免费项目（Region 选离你近的，例如 Singapore / Tokyo）。项目地址里的 `<ref>` 就是 `https://<ref>.supabase.co` 那一段。
+2. **建表**：左侧 **SQL Editor** → New query → 把 `supabase/schema.sql` 全部粘贴进去 → **Run**。可以重复执行。**Table Editor** 里会出现 `aistatus_sessions`（标着 RLS enabled）。
+3. **生成两个 token**（在 Mac 终端里，各执行一次，记下来）：
+   ```sh
+   node -e "console.log(require('crypto').randomBytes(24).toString('base64url'))"
+   ```
+4. **设置 Secrets**：左侧 **Edge Functions** → **Secrets** → 添加 `AISTATUS_READ_TOKEN` = 第一个 token、`AISTATUS_HOOK_TOKEN` = 第二个 token（想在手表详情里看到项目名和消息，再加 `AISTATUS_STORE_DETAILS` = `1`）→ Save。
+5. **部署函数**：**Edge Functions** → **Deploy a new function** → **Via Editor** → 函数名填 **`aistatus`** → 删掉模板代码，把 `supabase/functions/aistatus/index.ts` 的**全部内容**粘贴进去 → **Deploy function**（10–30 秒）。
+6. **关掉 JWT 校验**（必须）：打开函数 `aistatus` 的详情 / 设置页，把 **Verify JWT**（也可能叫 “Enforce JWT Verification” / “Verify JWT with legacy secret”）关掉并保存。否则 Supabase 会在函数运行前用 `401` 拒绝所有请求——我们的 token 不是 Supabase 的 JWT，函数自己检查。
+   （用 Supabase CLI 的话等价于 `supabase functions deploy aistatus --no-verify-jwt`；这里没有用 CLI。）
+7. 检查：`curl https://<ref>.supabase.co/functions/v1/aistatus/health` 应返回 `{"ok":true}`。返回 `401` 说明第 6 步没生效；`404` 说明函数名或地址不对。
+
+**B. Mac 上**
+
+```sh
+cd ~/projects/ai_status
+node bin/aistatus.js cloud setup --url https://<ref>.supabase.co/functions/v1/aistatus \
+  --hook-token <第二个 token> --read-token <第一个 token>
+node bin/aistatus.js cloud status     # health / hook token / read token 三项都应是 OK
+node bin/aistatus.js list             # 云端模式下 list / dismiss / health / 实时视图都读云端（--local 读本地守护进程）
+```
+
+- `cloud setup` 写 `~/.aistatus/cloud.json`（给 CLI 用）和 `~/.aistatus/cloud.curl`（给转发脚本用，含钩子 token），都是 600 权限，并刷新 `~/.aistatus/bin/aistatus-hook`。**`~/.claude/settings.json` 和 `~/.codex/hooks.json` 一个字节都不改**，Codex 不需要重新信任。之后的新事件立刻发往云端（不用重启 Claude / Codex）。
+- 电脑名默认是这台 Mac 的名字，`--machine <名字>` 可改。
+- 守护进程可以继续运行（收不到钩子了，但随时可以 `cloud off` 切回去），也可以停掉：`launchctl bootout gui/$(id -u)/com.aistatus.daemon`。Funnel 不再需要：`tailscale funnel --bg 7779 off`（你自己执行）。
+- `cloud status` 末尾会打印 Windows 安装命令和手表的 `generate.sh` 命令（加 `--show` 显示 token）。
+
+**C. Windows 上**
+
+把新版 `hooks\aistatus-hook.ps1` 和 `scripts\install-windows.ps1` 拷过去（保持目录结构），在 PowerShell 或 cmd 里：
+
+```bat
+powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\install-windows.ps1 -BaseUrl https://<ref>.supabase.co/functions/v1/aistatus -Token "<第二个 token>"
+```
+
+应看到 `test: OK, the hub accepted a hook from '<电脑名>'`（测试发的是一个函数会忽略的事件，不会产生卡片）。`-BaseUrl` 现在可以带路径。钩子命令行和 `timeout` 不变，**Codex 不需要重新信任**。
+
+**D. 手表**
+
+```sh
+cd watch
+./scripts/generate.sh --host https://<ref>.supabase.co/functions/v1/aistatus --token <第一个 token>
+```
+
+然后在 Xcode 里重新装到手表（免费开发者账号 7 天签名照旧）。如果以前在手表设置里改过主机或 token：长按 → 设置，点 “Use https://…” 和 “Use built-in token”。
+
+### 回滚
+
+- **Mac**：`node bin/aistatus.js cloud off`，钩子立刻改回发给本地守护进程（守护进程要在运行）。`cloud on` 再切回云端（配置还在）。
+- **Windows**：用原来的地址重新运行安装脚本，例如 `-BaseUrl https://danielmacbook-air.tail66228a.ts.net -Token "<hookToken>"` 或 `-MacHost <ip>`。新版脚本对守护进程同样适用（过滤规则对守护进程的结果一样）。
+- **手表**：用原来的 `--host` / `--token` 重新 `generate.sh` 并安装，或在手表设置里改。
+- **代码**：改动前的版本打了标签 `v1-mac-hub-tailscale`（`git checkout v1-mac-hub-tailscale`）。守护进程的 `state.json` 格式没有变。
+- **Supabase**：删除函数 `aistatus`；SQL Editor 里 `drop table public.aistatus_sessions;`。
+
+### 经过第三方的数据
+
+- Supabase 能看到：默认只有电脑名、会话 id、状态和时间（开了 `AISTATUS_STORE_DETAILS` 还有项目文件夹名和消息摘要），以及请求的 IP 和时间。钩子 token / 读取 token 在请求头里（HTTPS）。
+- 云端模式下，工具活动事件只发精简 JSON；其他事件（提示、完成、权限请求等）仍然发原始钩子 JSON（可能包含提示词、`cwd`、工具输入），**函数在保存前丢弃**这些字段，但它们经过了 Supabase 的网络和函数运行时。
+- 免费项目 7 天没有活动会被暂停（暂停后函数也不可用，需要在网页上恢复）；平时钩子和手表请求应该算作活动（未验证）。
+
+### 已在本机验证
+
+- `npm test`：状态机（`test/store.test.js`，守护进程的全部原有测试）、函数请求处理（`test/hub.test.js`：认证矩阵、最少数据 / 详细模式、并发竞争、dismiss、清理）、打包后的 `index.ts` 本身（`test/hub-bundle.test.js`：用假的 `Deno` 全局对象和模拟 PostgREST 的假 supabase-js 客户端运行打包文件，覆盖环境变量、key 的选择、`Deno.serve`、并发）、真实转发脚本 → 本地 Node 服务器（挂载同一个处理函数）→ 手表格式（`test/cloud.test.js`：事件过滤和调用次数、`cloud setup/status/off/on`、设置文件逐字节不变、`list/dismiss/health`、`cloud off` 后回到本地守护进程），Windows 脚本与 Mac 脚本过滤表一致（`test/senders.test.js`，静态对比）。
+- `watch/scripts/check.sh`：带路径的地址、`/events` 返回 404/405/501 时只轮询且不再重试、轮询不显示标记、放下手腕停止轮询、轮询间隔、解码函数返回的快照（`Fixtures/sessions-cloud.json`，由 `test/cloud.test.js` 生成并校验）、`generate.sh` 和 `xcodebuild` 对带路径地址的展开；用假地址做的 watchOS 真机构建成功，产物 Info.plist 里是完整的 `https://…/functions/v1/aistatus`。
+- 本地试用（不需要 Supabase）：`AISTATUS_READ_TOKEN=… AISTATUS_HOOK_TOKEN=… node scripts/hub-local.mjs`，然后 `aistatus cloud setup --url http://127.0.0.1:17810/functions/v1/aistatus …`（http 只允许 127.0.0.1 / localhost）。
+
+### 尚未验证
+
+- **没有在真实的 Supabase 上运行过**（按要求没有部署、没有连接任何项目），这里也没有 Deno / Docker / Supabase CLI。具体是：
+  - Deno 适配层（`src/hub/deno-entry.js`）：`Deno.serve`、`Deno.env.get`、`npm:@supabase/supabase-js@2` 的导入方式、`SUPABASE_SECRET_KEYS`（取 `default`）/ `SUPABASE_SERVICE_ROLE_KEY` 的选择——都按 2026-10 的 Supabase 文档写的，只在 Node 里用假对象跑过。
+  - 网页编辑器对一个 38 KB、带 `// @ts-nocheck` 的单文件是否直接接受（文档说编辑器会做类型检查）。
+  - 函数收到的路径：按文档应是 `/aistatus/...`；处理函数同时接受 `/aistatus/...`、`/functions/v1/aistatus/...` 和不带前缀的路径。
+  - “Verify JWT” 开关在网页上的确切名字和位置（文档只写了 `config.toml` 的 `verify_jwt = false` 和 CLI 的 `--no-verify-jwt`）。
+  - `supabase/schema.sql` 没有在 Postgres 上执行过（这里没有 Postgres）；PostgREST 的行为（`update … eq(version) … select()` 返回受影响的行、重复插入返回 `23505`、`bigint` 以 JSON 数字返回）是按文档和 supabase-js 的已知行为模拟的。
+  - 冷启动延迟和从你所在网络到 Supabase 的延迟：Mac 钩子总超时 2.5 秒、Windows 每步 1.4 秒，超时的事件会丢失（卡片可能停在旧状态，直到下一个事件）。
+- Windows 脚本的新过滤逻辑没有实际运行过（这里没有 PowerShell）。
+- 手表上真实的轮询 / 抬腕行为、`.inactive` 时停止轮询的实际效果。
+
 ## 开发
 
 ```
-src/store.js          状态机与钩子归一化
+src/core.js           状态机与钩子归一化（纯 JS，无 Node API；守护进程和 Supabase 函数共用）
+src/store.js          守护进程用的 SessionStore（包装 core.js）
+src/cloud.js          云端模式：aistatus cloud setup/status/on/off
+src/hub/handler.js    云端中转的请求处理（Request -> Response，Deno 和 Node 都能跑）
+src/hub/supabase-storage.js  基于 supabase-js 的存储（按 version 比较后写入）
+src/hub/memory-storage.js    内存存储（测试、本地试用；语义同 SQL）
+src/hub/deno-entry.js 函数入口（Deno.env、createClient、Deno.serve）
+src/hub/node-server.js 把处理函数挂到 Node HTTP 服务器上（测试、本地试用）
+supabase/schema.sql   建表 SQL（幂等）
+supabase/functions/aistatus/index.ts  生成的函数文件（node scripts/build-supabase.mjs）
+scripts/build-supabase.mjs  生成上面的文件（--check 只检查）
+scripts/hub-local.mjs 本地假云端（内存，端口 17810）
 src/server.js         HTTP / SSE API
 src/daemon.js         组装：持久化、Bonjour、Codex 监听
 src/codex-watcher.js  Codex rollout 文件监听
@@ -384,6 +539,7 @@ scripts/e2e.mjs       端到端检查（临时 HOME，默认端口 17778）
 scripts/e2e-remote.mjs 远程钩子端到端检查（临时 HOME，默认端口 17790，用 curl 打本机局域网 IP）
 scripts/e2e-public.mjs 公网监听端口端到端检查（临时 HOME，端口 17800/17801/17802，全部只绑 127.0.0.1，带一个模拟 Funnel 的本地反向代理）
 test/public.test.js    公网监听端口的单元测试
+test/hub.test.js, test/hub-bundle.test.js, test/cloud.test.js, test/senders.test.js  云端中转
 ```
 
 测试与 e2e 只使用临时 HOME，不会修改真实的 `~/.claude`、`~/.codex` 或加载 launchd 任务。
@@ -442,6 +598,7 @@ test/public.test.js    公网监听端口的单元测试
 
 - 前台时用 `URLSession.bytes` 连 `GET /events`（SSE，自己按字节解析，因为 `AsyncBytes.lines` 会吞掉空行）；首个快照 8 秒内没到（例如代理缓冲了流）或连接断开 → 立即 `GET /sessions` 轮询（每 5 秒），同时按指数退避（1→2→4…30 秒，±20% 抖动）重连 SSE；连续 2 次失败才显示离线。SSE 空闲 40 秒（守护进程每 15 秒 ping）视为断线。
 - 应用进入后台（`scenePhase == .background`）即断开；抬腕回来自动重连。
+- 服务器没有 SSE（`/events` 返回 404 / 405 / 501，例如[云端中转](#云端中转supabase)）时只轮询（间隔见设置 → Refresh，默认 5 秒），不显示轮询标记，手腕放下（`.inactive`）时也停止轮询。主机可以是带路径的完整地址（`https://<ref>.supabase.co/functions/v1/aistatus`）。
 - 时钟偏差：每份快照的 `serverTime` 与本地收到时刻（轮询取往返中点）求差，取最近 5 个样本的中位数，所有时间戳换算成本地时间再交给计时文本。
 - 没有使用 Bonjour 浏览：普通 watchOS 应用基本拿不到 Network.framework 的 NWBrowser/NWConnection，所以手动主机是基线。
 - Info.plist：`NSAppTransportSecurity → NSAllowsLocalNetworking = YES`（允许明文 HTTP 到 `.local`、不带点的主机名和局域网 IP；**故意没有**加 `NSAllowsArbitraryLoads`，两者同时存在时后者会被忽略；到公网 `https://` 地址本来就允许，不需要例外）、`NSLocalNetworkUsageDescription`、`NSBonjourServices = _aistatus._tcp`、`WKApplication`、`WKWatchOnly`。

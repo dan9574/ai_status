@@ -63,7 +63,7 @@ mini() {
 }
 send() {
   if [ "${1:-}" = mini ] || [ "${#body}" -gt 262144 ]; then body=$(mini); fi
-  printf '%s' "$body" | /usr/bin/curl -s -o /dev/null --connect-timeout 2 --max-time 2.5 -K "$cloud" \
+  printf '%s' "$body" | /usr/bin/curl -q -s -o /dev/null --connect-timeout 2 --max-time 2.5 -K "$cloud" \
     -H 'Content-Type: application/json' --data-binary @- \
     "$base/hook/$tool${query:+?$query}" >/dev/null 2>&1
 }

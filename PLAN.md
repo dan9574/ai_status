@@ -1,7 +1,7 @@
 # ai_status：手表上查看 Claude Code / Codex 多会话状态
 
 ## 目标
-办公时多项目并行，抬腕就能看到每个 AI 会话的状态。默认在本地局域网使用；网络禁止设备互访时可经 Tailscale Funnel 的公网 HTTPS 地址访问（见 README “公网地址”）。不做完成百分比。
+办公时多项目并行，抬腕就能看到每个 AI 会话的状态。默认在本地局域网使用；网络禁止设备互访时可经 Tailscale Funnel 的公网 HTTPS 地址访问（见 README “公网地址”），或者不用 Mac 当中心、改用 Supabase 上的云端中转（见 README “云端中转（Supabase）”）。不做完成百分比。
 
 ## 核心体验
 - 用途：抬腕数一数完成了几个任务，不需要知道每个任务是什么。
@@ -44,6 +44,13 @@
    - CLI：`token --read` / `--new --shared`、`public-url`、`public-status`、`remote-setup` 打印 `-BaseUrl` 安装命令。
    - 手表：主机可填 `https://…`（默认 443），所有请求带 token；`generate.sh --host <url> --token <token>` 编进 Info.plist，手表上不用输入。
    - Windows：配置文件加 `url`，转发脚本走 HTTPS（显式 TLS 1.2）；钩子命令和 `hooks.json` 条目不变，不需要重新信任。
+6. **云端中转（Supabase）**（分支 `supabase-hub`，接在公网地址之后；回滚标签 `v1-mac-hub-tailscale`）
+   - 隧道不稳定、Mac 必须一直开着 → 中心搬到 Supabase 免费版的一个 Edge Function（`aistatus`）+ 一张 Postgres 表。Mac 和 Windows 的钩子直接发给它，手表直接轮询它。
+   - 协议不变（`POST /hook/:tool`、`GET /sessions`、`POST /sessions/:id/dismiss`、`GET /health`，在函数地址下面）；`GET /events` 返回 501，手表只轮询。token 来自函数 Secrets（`AISTATUS_READ_TOKEN` / `AISTATUS_HOOK_TOKEN`），规则同公网监听端口。每个钩子都算远程，id `tool@machine:sid`。
+   - 状态机抽成纯 JS 的 `src/core.js`（无 Node API、时间可注入），守护进程和函数共用；`src/hub/handler.js` 是运行时无关的 `Request → Response` 处理函数；`scripts/build-supabase.mjs` 打成一个文件 `supabase/functions/aistatus/index.ts`（网页编辑器里整个粘贴；测试检查与源码一致）。
+   - 存储：每个会话一行（`state jsonb` + `version`），比较版本后写入（乐观并发，冲突从读开始重试）；RLS 开、无策略，只有函数的 service role 能访问。默认只存最少数据，`AISTATUS_STORE_DETAILS=1` 才存项目名和消息摘要。
+   - 省调用次数（免费 50 万次/月）：发送端只发会改变卡片的事件；工具活动只在“等待中 / 刚 Stop”的标记文件存在时发一次，且只发精简 JSON。手表只在亮屏时轮询（默认 5 秒，可设置）。典型约 1,000 次/天。
+   - Mac：`aistatus cloud setup|status|off|on`，转发脚本按 `~/.aistatus/cloud.curl` 是否存在决定发往哪里，钩子命令行不变；`aistatus list` 等在云端模式下读云端。Windows：`-BaseUrl` 可以带路径。手表：地址可以带路径。
 
 ## 状态机
 | 事件 | 结果 |
@@ -65,6 +72,7 @@
 - 阶段三 ✅ 已实测（2026-10-03）：Windows 上的 Codex 桌面版通过局域网把钩子事件上报到 Mac（令牌校验），手表上显示为独立一格；子代理未结束时保持 running；Mac 上 Codex 钩子已信任。
 - 公网地址 🟡 代码完成（分支 `public-endpoint`，2026-10-03）：`npm test` 93 项（新增 19）、`scripts/e2e-public.mjs` 40 项、`watch/scripts/check.sh` 509 项通过，watchOS 真机构建成功（未安装）。**待上线**：设置 token → 重启守护进程 → 用户执行 `tailscale funnel --bg 7779` → 带地址和 token 重新构建手表应用 → Windows 重新安装配置。未实测：真实 Funnel（是否带 `X-Forwarded-For`、SSE 是否缓冲）、Windows 上的 HTTPS 分支。
 - 阶段四 ⏸ 搁置：后台刷新 / 推送。改用“应用常驻前台当默认屏幕”的做法后暂不需要。
+- 云端中转 🟡 代码完成（分支 `supabase-hub`，2026-10-04）：`npm test` 131 项（新增 38：函数请求处理、打包文件本身、真实转发脚本端到端、Mac/Windows 过滤表一致）、`watch/scripts/check.sh` 569 项通过，带路径地址的 watchOS 真机构建成功（未安装）。**待上线**：用户在 Supabase 网页上建表、设 Secrets、部署函数并关掉 JWT 校验 → Mac `aistatus cloud setup` → Windows 重新安装（`-BaseUrl`）→ 手表重新构建。**未验证**：真实 Supabase（Deno 适配层、SQL、PostgREST 行为、网页编辑器、JWT 开关）、Windows 上的新过滤逻辑、手表上的实际轮询行为。
 
 ## 当前环境
 - macOS 27.0.1（Apple M2，8 GB），Xcode 27.0（Swift 6.4，watchOS 27 SDK；未装 watchOS 模拟器运行时）；XcodeGen 在 `.tools/xcodegen`（不入库）。已配对 Apple Watch SE 3（watchOS 26.6）。

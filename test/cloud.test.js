@@ -270,6 +270,26 @@ test('cloud mode without a read token: viewer commands explain; --local uses the
   fs.rmSync(home, { recursive: true, force: true });
 });
 
+test('live view in cloud mode polls the hub (no SSE)', async () => {
+  const home = mkHome();
+  await cli(home, 'cloud', 'setup', '--url', hub.url, '--hook-token', HOOK, '--read-token', READ, '--no-probe');
+  const before = hub.stats.byPath['/functions/v1/aistatus/sessions'] || 0;
+  const out = await new Promise((resolve) => {
+    const p = spawn(process.execPath, [path.join(ROOT, 'bin', 'aistatus.js'), '--interval', '2'], { env: env(home) });
+    let text = '';
+    p.stdout.on('data', (d) => {
+      text += d;
+      if (/cloud, every 2s/.test(text)) p.kill('SIGTERM');
+    });
+    p.on('close', () => resolve(text));
+    setTimeout(() => p.kill('SIGKILL'), 5000);
+  });
+  assert.match(out, /aistatus · \d+ cards? · .* · cloud, every 2s/);
+  assert.ok((hub.stats.byPath['/functions/v1/aistatus/sessions'] || 0) > before, 'polled GET /sessions');
+  assert.equal(hub.stats.byPath['/functions/v1/aistatus/events'] || 0, 0, 'never asks for /events');
+  fs.rmSync(home, { recursive: true, force: true });
+});
+
 test('watch fixture Fixtures/sessions-cloud.json is what the hub serves (AIStatusChecks decodes it)', async () => {
   // Deterministic hub output: minimal data mode, two machines, all three statuses.
   const st = new MemoryStorage();
