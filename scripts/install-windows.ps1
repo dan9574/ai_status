@@ -27,6 +27,8 @@
 .EXAMPLE
   powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\install-windows.ps1 -BaseUrl https://mac.tailnet.ts.net -Token abc123
 .EXAMPLE
+  powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\install-windows.ps1 -BaseUrl https://<ref>.supabase.co/functions/v1/aistatus -Token <hook token>
+.EXAMPLE
   powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\install-windows.ps1 -Uninstall
 #>
 [CmdletBinding()]
@@ -183,13 +185,14 @@ function Update-CodexHooks([bool]$Install) {
 }
 
 function ConvertTo-BaseUrl([string]$Raw) {
-    # Accepts http(s)://host[:port][/]; returns it without the trailing slash.
+    # Accepts http(s)://host[:port][/path][/], e.g. https://mac.tailnet.ts.net or
+    # https://<ref>.supabase.co/functions/v1/aistatus; returns it without the trailing slash.
     $u = $null
-    if (-not [System.Uri]::TryCreate($Raw.Trim(), [System.UriKind]::Absolute, [ref]$u)) { throw "-BaseUrl '$Raw' is not a URL (example: https://mac.tailnet.ts.net)" }
+    if (-not [System.Uri]::TryCreate($Raw.Trim(), [System.UriKind]::Absolute, [ref]$u)) { throw "-BaseUrl '$Raw' is not a URL (example: https://<ref>.supabase.co/functions/v1/aistatus)" }
     if ($u.Scheme -ne 'https' -and $u.Scheme -ne 'http') { throw "-BaseUrl must start with https:// (or http://)" }
-    if ($u.UserInfo -or $u.Query -or $u.Fragment -or ($u.AbsolutePath -ne '/')) { throw "-BaseUrl must be just scheme://host[:port], without path, query or credentials" }
+    if ($u.UserInfo -or $u.Query -or $u.Fragment) { throw "-BaseUrl must not contain a query, fragment or credentials" }
     if ($u.Scheme -eq 'http') { Write-Warning '-BaseUrl uses plain http: the token is sent unencrypted. Prefer the https URL.' }
-    return $u.GetLeftPart([System.UriPartial]::Authority)
+    return ($u.GetLeftPart([System.UriPartial]::Authority) + $u.AbsolutePath).TrimEnd('/')
 }
 
 function Get-BaseUri($cfg) {
@@ -225,10 +228,11 @@ function Install-HookScript([string]$MacHostForDownload, [int]$PortForDownload) 
 }
 
 function Test-Remote($cfg) {
-    # Sends a SessionStart for a dummy session: it creates no visible card on the
-    # watch, but proves address, port, firewall and token in one request.
+    # Sends an event every hub ignores (nothing is stored, no card appears), but
+    # the hub checks the token first: proves address, port, firewall and token
+    # in one request.
     $uri = (Get-BaseUri $cfg) + '/hook/codex?machine=' + [System.Uri]::EscapeDataString([string]$cfg.machine)
-    $body = [System.Text.Encoding]::UTF8.GetBytes('{"session_id":"aistatus-install-check","hook_event_name":"SessionStart","source":"startup"}')
+    $body = [System.Text.Encoding]::UTF8.GetBytes('{"session_id":"aistatus-install-check","hook_event_name":"AIStatusCheck"}')
     try {
         $req = [System.Net.HttpWebRequest][System.Net.WebRequest]::Create($uri)
         $req.Method = 'POST'
@@ -239,12 +243,15 @@ function Test-Remote($cfg) {
         if ($cfg.token) { $req.Headers.Add('Authorization', 'Bearer ' + [string]$cfg.token) }
         $out = $req.GetRequestStream(); $out.Write($body, 0, $body.Length); $out.Close()
         $resp = $req.GetResponse(); $resp.Close()
-        Write-Host "test: OK, the Mac accepted a hook from '$($cfg.machine)'" -ForegroundColor Green
+        Write-Host "test: OK, the hub accepted a hook from '$($cfg.machine)'" -ForegroundColor Green
     } catch [System.Net.WebException] {
         $code = 0
         if ($_.Exception.Response) { $code = [int]$_.Exception.Response.StatusCode }
         switch ($code) {
-            401 { Write-Warning 'test: the Mac rejected the token (401). Check it with `aistatus token` on the Mac.' }
+            401 { if ($cfg.url -and $cfg.url.Contains('/functions/')) { Write-Warning 'test: the cloud hub rejected the token (401): use the AISTATUS_HOOK_TOKEN secret of the function; also check that "Verify JWT" is turned off for the function.' } else { Write-Warning 'test: the Mac rejected the token (401). Check it with `aistatus token` on the Mac.' } }
+            404 { Write-Warning "test: $uri answered 404: wrong -BaseUrl? (cloud hub: https://<ref>.supabase.co/functions/v1/aistatus)" }
+            503 { Write-Warning 'test: the hub answered 503: on the cloud hub the AISTATUS_READ_TOKEN / AISTATUS_HOOK_TOKEN secrets are probably not set.' }
+            500 { Write-Warning 'test: the hub answered 500: on the cloud hub check the function logs (was supabase/schema.sql run?).' }
             403 { Write-Warning 'test: the Mac has remote hooks disabled (403). On the Mac run `aistatus token --new --hooks-only` and restart the daemon.' }
             429 { Write-Warning 'test: too many wrong tokens recently (429); wait a minute, then check the token with `aistatus token` on the Mac.' }
             502 { Write-Warning 'test: the tunnel answered but the daemon did not (502). On the Mac: `aistatus public-status`.' }

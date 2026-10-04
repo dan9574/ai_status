@@ -233,6 +233,12 @@ export async function cloudStatus({ flags = {}, p = getPaths() } = {}) {
     lines.push(...r.lines);
     ok = ok && r.ok;
   }
+  lines.push('');
+  lines.push('Other devices:');
+  lines.push('  Windows (Codex), with hooks\\aistatus-hook.ps1 and scripts\\install-windows.ps1 from this repo (keep the folder layout):');
+  lines.push(`    powershell -NoProfile -ExecutionPolicy Bypass -File .\\scripts\\install-windows.ps1 -BaseUrl '${cfg.url}' -Token '${show ? cfg.hookToken : '<hook token>'}'`);
+  lines.push('  Watch (rebuild):');
+  lines.push(`    watch/scripts/generate.sh --host ${cfg.url} --token ${show && cfg.readToken ? cfg.readToken : '<read token>'}`);
   if (!show && (cfg.hookToken || cfg.readToken)) lines.push('Tokens are hidden; add --show to print them.');
   console.log(lines.join('\n'));
   if (!ok) process.exitCode = 1;
