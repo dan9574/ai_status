@@ -5,6 +5,7 @@ import { execFileSync } from 'node:child_process';
 import { loadConfig, paths as getPaths, generateToken, updateUserConfig, hookTokenOf, localMachineName } from './config.js';
 import { renderCards } from './render.js';
 import { installHooks, uninstallHooks, installDaemonPlist } from './installer.js';
+import { cloudActive, cloudCommand, cloudFetch } from './cloud.js';
 
 const USAGE = `aistatus — Claude Code / Codex session status
 
@@ -35,10 +36,21 @@ Usage:
                                 is the public listener (publicPort) up, which
                                 tokens are set (--show prints them), and does
                                 the public URL answer
+  aistatus cloud setup --url URL --hook-token T [--read-token T] [--machine NAME] [--no-probe]
+                                cloud mode: hooks post to the cloud hub (Supabase
+                                Edge Function) instead of the local daemon; the
+                                hook entries in the agents' settings do not change
+  aistatus cloud status [--show] [--no-probe]
+                                cloud configuration + probes (--show prints tokens)
+  aistatus cloud off | on       back to the local daemon / to the saved cloud hub
 
 Options:
   --port N    daemon port (default from ~/.aistatus/config.json, else 7778)
   --host H    daemon host for viewer commands (default 127.0.0.1)
+  --local     viewer commands use the local daemon even in cloud mode
+  --interval S  live view poll interval in cloud mode (default 5 s)
+In cloud mode (aistatus cloud setup), the viewer commands (live view, list,
+dismiss, health) talk to the cloud hub with the saved read token.
 `;
 
 function parseArgs(argv) {
@@ -48,7 +60,7 @@ function parseArgs(argv) {
     if (a.startsWith('--')) {
       const [k, v] = a.slice(2).split('=');
       if (v !== undefined) args.flags[k] = v;
-      else if (['port', 'host', 'public-url'].includes(k)) args.flags[k] = argv[++i];
+      else if (['port', 'host', 'public-url', 'url', 'hook-token', 'read-token', 'machine', 'interval'].includes(k)) args.flags[k] = argv[++i];
       else args.flags[k] = true;
     } else args._.push(a);
   }
@@ -428,6 +440,109 @@ async function remoteSetup({ cfg, port, flags = {} }) {
   if (!token) process.exitCode = 1;
 }
 
+// ------------------------------------------------------- viewer in cloud mode
+
+function needReadToken(cloud) {
+  if (cloud.readToken) return true;
+  console.error('cloud mode: no read token saved. Run: aistatus cloud setup --url … --hook-token … --read-token …  (or add --local)');
+  process.exitCode = 1;
+  return false;
+}
+
+function cloudFailed(cloud, r) {
+  console.error(`cloud hub ${cloud.url}: ${r.error || `HTTP ${r.status} ${r.json?.error || ''}`.trim()}  (check: aistatus cloud status; local daemon: --local)`);
+  process.exitCode = 1;
+}
+
+/** Live view against the cloud hub: polls GET /sessions (no event stream there). */
+async function liveCloud(cloud, intervalSec) {
+  const out = process.stdout;
+  const tty = out.isTTY;
+  let snapshot = null;
+  let skew = 0;
+  let status = 'connecting…';
+  const draw = () => {
+    const now = Date.now() + skew;
+    const n = snapshot?.sessions?.length ?? 0;
+    const head = `aistatus · ${n} card${n === 1 ? '' : 's'} · ${new Date().toLocaleTimeString()} · ${status}`;
+    const body = snapshot ? renderCards(snapshot, { now, color: !!tty, width: out.columns || 80 }) : '';
+    const frame = `${head}\n\n${body}\n\n\x1b[2m q quit · aistatus dismiss <id>\x1b[0m`;
+    if (tty) out.write('\x1b[H\x1b[2J' + frame);
+    else out.write(frame + '\n');
+  };
+  const poll = async () => {
+    const r = await cloudFetch(cloud, 'GET', '/sessions', { token: cloud.readToken });
+    if (r.status === 200 && r.json?.sessions) {
+      snapshot = r.json;
+      skew = snapshot.serverTime - Date.now();
+      status = `cloud, every ${intervalSec}s`;
+    } else status = `cloud: ${r.error || `HTTP ${r.status}`}`;
+    draw();
+  };
+  const cleanup = () => {
+    if (tty) out.write('\x1b[?25h\x1b[?1049l');
+    process.exit(0);
+  };
+  if (tty) {
+    out.write('\x1b[?1049h\x1b[?25l');
+    if (process.stdin.isTTY) {
+      process.stdin.setRawMode(true);
+      process.stdin.resume();
+      process.stdin.on('data', (d) => {
+        const k = d.toString();
+        if (k === 'q' || k === '\x03' || k === '\x1b') cleanup();
+      });
+    }
+  }
+  process.on('SIGINT', cleanup);
+  process.on('SIGTERM', cleanup);
+  await poll();
+  setInterval(poll, intervalSec * 1000);
+  setInterval(draw, 1000);
+}
+
+async function cloudViewer(cmd, cloud, _, flags) {
+  if (!needReadToken(cloud)) return;
+  const token = cloud.readToken;
+  switch (cmd) {
+    case 'watch': {
+      const sec = Math.max(2, Number(flags.interval) || 5);
+      return liveCloud(cloud, sec);
+    }
+    case 'list': {
+      const r = await cloudFetch(cloud, 'GET', '/sessions', { token });
+      if (r.status !== 200 || !r.json?.sessions) return cloudFailed(cloud, r);
+      if (flags.json) console.log(JSON.stringify(r.json, null, 2));
+      else {
+        const skew = r.json.serverTime - Date.now();
+        console.log(renderCards(r.json, { now: Date.now() + skew, color: !!process.stdout.isTTY, width: process.stdout.columns || 100 }));
+      }
+      return;
+    }
+    case 'dismiss': {
+      const id = _[1];
+      if (!id) {
+        console.error('usage: aistatus dismiss <id>');
+        process.exitCode = 2;
+        return;
+      }
+      const r = await cloudFetch(cloud, 'POST', `/sessions/${encodeURIComponent(id)}/dismiss`, { token, body: {} });
+      if (r.status === 200) console.log(`dismissed ${r.json.dismissed.id}${r.json.dismissed.project ? ` (${r.json.dismissed.project})` : ''}`);
+      else if (r.status === 404) {
+        console.error(`dismiss failed: ${r.json?.error || 'not found'}`);
+        process.exitCode = 1;
+      } else cloudFailed(cloud, r);
+      return;
+    }
+    case 'health': {
+      const r = await cloudFetch(cloud, 'GET', '/health', { token });
+      if (r.status !== 200) return cloudFailed(cloud, r);
+      console.log(JSON.stringify(r.json, null, 2));
+      return;
+    }
+  }
+}
+
 export async function main(argv = process.argv.slice(2)) {
   const { _, flags } = parseArgs(argv);
   const cfg = loadConfig(getPaths());
@@ -435,6 +550,10 @@ export async function main(argv = process.argv.slice(2)) {
   const host = flags.host || '127.0.0.1';
   const cmd = _[0] || 'watch';
   if (flags.help || flags.h) return process.stdout.write(USAGE);
+  if (['watch', 'list', 'dismiss', 'health'].includes(cmd) && !flags.local && !flags.host) {
+    const cloud = cloudActive();
+    if (cloud) return cloudViewer(cmd, cloud, _, flags);
+  }
 
   switch (cmd) {
     case 'watch':
@@ -537,6 +656,9 @@ export async function main(argv = process.argv.slice(2)) {
 
     case 'public-status':
       return publicStatus({ cfg, port, flags });
+
+    case 'cloud':
+      return cloudCommand(_, flags);
 
     case 'help':
     case '--help':

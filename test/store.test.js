@@ -464,3 +464,19 @@ test('normalizeHook: Subagent events need an agent_id', () => {
   assert.equal(normalizeHook('codex', sub('s', 'SubagentStop', 'a')).type, 'subStop');
   assert.equal(normalizeHook('claude', sub('s', 'PostToolUse', 'a')).agentId, 'a');
 });
+
+test('SubagentStart on a session whose prompt was missed keeps that sub-agent', () => {
+  const { store, hook } = mk();
+  hook('claude', sub('m1', 'SubagentStart', 'a'));
+  const c = store.cards()[0];
+  assert.equal(c.status, 'running');
+  assert.equal(c.startedAtApprox, true);
+  assert.equal(c.activeSubagents, 1);
+});
+
+test('core module is runtime-neutral: no imports, no Node globals', async () => {
+  const fs = await import('node:fs');
+  const src = fs.readFileSync(new URL('../src/core.js', import.meta.url), 'utf8');
+  assert.doesNotMatch(src, /^\s*import\b/m);
+  assert.doesNotMatch(src, /\b(require|process|Buffer|__dirname)\b/);
+});

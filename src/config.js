@@ -4,6 +4,9 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import crypto from 'node:crypto';
+import { sanitizeMachine } from './core.js';
+
+export { sanitizeMachine };
 
 export const VERSION = '0.1.0';
 
@@ -97,21 +100,6 @@ export function loadConfig(p = paths()) {
   if (process.env.AISTATUS_CODEX_SOURCE) cfg.codex = { ...cfg.codex, source: process.env.AISTATUS_CODEX_SOURCE };
   cfg.codex.sessionsDir = cfg.codex.sessionsDir || p.codexSessions;
   return cfg;
-}
-
-/**
- * Sanitise a machine display name: letters, digits, '.', '_' and '-' only
- * (anything else becomes '-'), at most 32 characters. Returns null if empty.
- */
-export function sanitizeMachine(name) {
-  if (name == null) return null;
-  const s = String(name)
-    .normalize('NFC')
-    .replace(/[^\p{L}\p{N}._-]+/gu, '-')
-    .replace(/-{2,}/g, '-')
-    .replace(/^[-.]+|[-.]+$/g, '');
-  const out = [...s].slice(0, 32).join('').replace(/[-.]+$/, '');
-  return out || null;
 }
 
 /** Name of this computer as shown on cards: config.machine, else the hostname without ".local". */
