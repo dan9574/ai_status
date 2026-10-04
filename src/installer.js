@@ -253,7 +253,7 @@ ${arr([nodePath, daemonScript])}
   <key>KeepAlive</key>
   <true/>
   <key>ProcessType</key>
-  <string>Background</string>
+  <string>Standard</string>
   <key>StandardOutPath</key>
   <string>${xmlEscape(p.logFile)}</string>
   <key>StandardErrorPath</key>
