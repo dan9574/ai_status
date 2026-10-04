@@ -23,6 +23,20 @@ public enum FeedSource: Sendable, Equatable { case stream, poll }
 public enum FeedEvent: Sendable {
     case state(ConnectionState)
     case snapshot(TimedSnapshot, FeedSource)
+    /// The server has no event stream (`GET /events` answered 404, 405 or 501,
+    /// e.g. the cloud hub): this feed polls from now on and never retries SSE.
+    case streamUnavailable
+}
+
+extension DaemonError {
+    /// A definitive "no SSE here" answer, as opposed to a network problem.
+    public var meansNoStream: Bool {
+        switch self {
+        case .notFound: return true
+        case .http(let status, _): return status == 501 || status == 405
+        default: return false
+        }
+    }
 }
 
 /// Exponential backoff with jitter: base · factor^attempt, capped, ±jitter.
@@ -51,7 +65,7 @@ public struct Backoff: Equatable, Sendable {
 
 public struct FeedConfig: Sendable {
     public var backoff = Backoff()
-    /// Poll interval while SSE is down.
+    /// Poll interval while SSE is down or not offered (cloud hub).
     public var pollInterval: TimeInterval = 5
     /// An SSE connection must deliver its initial snapshot within this time
     /// (the daemon sends one immediately); otherwise it is abandoned. Also bounds
@@ -88,6 +102,10 @@ private final class Flag: @unchecked Sendable {
 /// 3. go to 1. Backoff grows only while SSE keeps failing without delivering
 ///    anything; one delivered snapshot resets it.
 ///
+/// A server without an event stream (`/events` answers 404, 405 or 501, like
+/// the cloud hub) is not an error: the feed reports `.streamUnavailable` once
+/// and from then on only polls every `pollInterval`, without retrying SSE.
+///
 /// Cancel the consuming task to stop everything (open requests are cancelled).
 public func sessionFeed(
     transport: DaemonTransport,
@@ -108,6 +126,7 @@ public func sessionFeed(
                 (error as? DaemonError)?.errorDescription ?? error.localizedDescription
             }
             setState(.connecting)
+            var useStream = config.useStream
             var sseFailures = 0 // consecutive SSE attempts that delivered nothing (drives backoff)
             var failures = 0 // consecutive failed attempts of any kind (drives .unreachable)
             var lastError = "Cannot reach Mac"
@@ -119,7 +138,7 @@ public func sessionFeed(
 
             while !Task.isCancelled {
                 // 1. SSE
-                if config.useStream {
+                if useStream {
                     let got = Flag()
                     var streamError: Error?
                     do {
@@ -149,6 +168,11 @@ public func sessionFeed(
                         lastState = .live
                         sseFailures = 0
                         failures = 0
+                    } else if let e = streamError as? DaemonError, e.meansNoStream {
+                        // Not a failure: this server only answers polls. Poll from
+                        // now on, quietly (no error state, no SSE retries).
+                        useStream = false
+                        continuation.yield(.streamUnavailable)
                     } else {
                         sseFailures += 1
                         failed(streamError ?? DaemonError.streamEnded)
@@ -156,7 +180,7 @@ public func sessionFeed(
                 }
 
                 // 2. poll until it is time to retry SSE
-                let window = config.useStream
+                let window = useStream
                     ? config.backoff.delay(attempt: max(0, sseFailures - 1), unit: random())
                     : config.pollInterval
                 var waited: TimeInterval = 0

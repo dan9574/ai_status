@@ -12,6 +12,7 @@ public struct AIStatusRootView: View {
     @AppStorage(SettingsKeys.host) private var host = BuildDefaults.host
     @AppStorage(SettingsKeys.port) private var port = DaemonEndpoint.defaultPort
     @AppStorage(SettingsKeys.token) private var token = BuildDefaults.token
+    @AppStorage(SettingsKeys.pollSeconds) private var pollSeconds = PollIntervals.default
     @Environment(\.scenePhase) private var scenePhase
     @State private var showSettings = false
 
@@ -46,12 +47,22 @@ public struct AIStatusRootView: View {
                     store.save(summary)
                     reload()
                 }
+                model.setPollInterval(TimeInterval(pollSeconds))
                 if scenePhase != .background { model.start(endpoint: endpoint) }
             }
             .onChange(of: scenePhase) { _, phase in
-                // Network only while the app is on screen; .inactive (wrist down,
-                // Always-On) keeps the connection so raising the wrist is instant.
-                if phase == .background { model.stop() } else { model.start(endpoint: endpoint) }
+                // Network only while the app is on screen. .inactive (wrist down,
+                // Always On) keeps an SSE connection so raising the wrist is
+                // instant, but stops polling: each poll is a request (a billed
+                // invocation on the cloud hub). Raising the wrist polls at once.
+                switch phase {
+                case .background: model.stop()
+                case .inactive: if model.pausesWhenInactive { model.stop() } else { model.start(endpoint: endpoint) }
+                default: model.start(endpoint: endpoint)
+                }
+            }
+            .onChange(of: pollSeconds) { _, new in
+                model.setPollInterval(TimeInterval(new))
             }
             .onChange(of: endpoint) { _, new in
                 model.start(endpoint: new)
@@ -75,7 +86,7 @@ public struct AIStatusRootView: View {
                 Group {
                     switch model.connection {
                     case .unreachable(let reason):
-                        UnreachableView(reason: reason, host: "\(endpoint.host):\(endpoint.port)",
+                        UnreachableView(reason: reason, host: endpoint.basePath.isEmpty ? "\(endpoint.host):\(endpoint.port)" : endpoint.host,
                                         retry: { model.restart() }, openSettings: openSettings)
                     case .connecting where !model.hasData:
                         ConnectingView(host: endpoint.host)

@@ -19,7 +19,7 @@ struct TileBoardView: View {
             GeometryReader { full in
                 TileBoard(
                     items: model.presentations, size: full.size, insets: insets,
-                    connection: model.connection, swipe: swipe, actions: actions
+                    connection: model.displayConnection, swipe: swipe, actions: actions
                 )
             }
             .ignoresSafeArea()

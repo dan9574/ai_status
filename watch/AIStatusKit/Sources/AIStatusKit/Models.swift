@@ -212,10 +212,13 @@ public struct SessionCard: Identifiable, Hashable, Sendable, Codable {
         machine = (try? c.decodeIfPresent(String.self, forKey: .machine)) ?? nil
     }
 
-    /// Human name for the card: project, else last path component of cwd, else a short session id.
+    /// Human name for the card: project, else last path component of cwd, else
+    /// the computer it runs on (the cloud hub stores no project names by
+    /// default), else a short session id.
     public var displayProject: String {
         if let p = project, !p.isEmpty { return p }
         if let cwd, let last = cwd.split(separator: "/").last { return String(last) }
+        if let m = machine, !m.isEmpty { return m }
         return String(sessionId.prefix(8))
     }
 }

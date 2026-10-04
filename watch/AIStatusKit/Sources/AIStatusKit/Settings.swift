@@ -5,6 +5,14 @@ public enum SettingsKeys {
     public static let host = "daemonHost"
     public static let port = "daemonPort"
     public static let token = "daemonToken"
+    /// Seconds between polls when the server has no event stream (cloud hub).
+    public static let pollSeconds = "pollSeconds"
+}
+
+/// Choices for `SettingsKeys.pollSeconds` (default 5 s).
+public enum PollIntervals {
+    public static let `default` = 5
+    public static let choices = [3, 5, 10, 15, 30, 60]
 }
 
 /// Values baked in at build time through Info.plist (see watch/Config/*.xcconfig,

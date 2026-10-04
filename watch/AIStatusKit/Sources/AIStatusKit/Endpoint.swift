@@ -10,6 +10,11 @@ public struct DaemonEndpoint: Hashable, Sendable {
     public var token: String?
     /// true for `https://…` hosts (e.g. a Tailscale Funnel URL); plain http otherwise.
     public var secure: Bool
+    /// Path prefix of every route, "" for a daemon at the root, or e.g.
+    /// "/functions/v1/aistatus" for the cloud hub (a Supabase Edge Function):
+    /// requests go to `<base>/sessions`, `<base>/health`, … Percent-encoded, no
+    /// trailing slash.
+    public var basePath: String
 
     /// Returns nil when the host is empty or the port is out of range.
     /// The host is normalised with `normalizeHost`. A port in the host field wins
@@ -27,6 +32,7 @@ public struct DaemonEndpoint: Hashable, Sendable {
         self.host = parsed.host
         self.port = port
         self.secure = parsed.secure
+        self.basePath = DaemonEndpoint.basePath(rawHost)
         let t = token?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
         self.token = t.isEmpty ? nil : t
     }
@@ -69,6 +75,31 @@ public struct DaemonEndpoint: Hashable, Sendable {
         return (s, port, secure)
     }
 
+    /// Routes of the API: a URL typed or pasted with one of these at the end
+    /// (".../sessions") means the base before it.
+    static let routeNames: Set<String> = ["sessions", "health", "events"]
+
+    /// The path part of what was typed in the host field, as a route prefix:
+    ///  - "https://ref.supabase.co/functions/v1/aistatus/" -> "/functions/v1/aistatus"
+    ///  - "https://mac.tailnet.ts.net", "mymac", "mymac:7778" -> ""
+    ///  - "https://host/base/sessions?x=1" -> "/base" (query, fragment and a
+    ///    trailing route name are dropped)
+    public static func basePath(_ raw: String) -> String {
+        var s = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        if let r = s.range(of: "://") { s = String(s[r.upperBound...]) }
+        if let cut = s.firstIndex(where: { $0 == "?" || $0 == "#" }) { s = String(s[..<cut]) }
+        guard let slash = s.firstIndex(of: "/") else { return "" }
+        var segments = s[slash...].split(separator: "/").map(String.init).filter { !$0.isEmpty && $0 != "." && $0 != ".." }
+        if let last = segments.last, routeNames.contains(last.lowercased()) { segments.removeLast() }
+        var allowed = CharacterSet.urlPathAllowed
+        allowed.remove(charactersIn: "/;")
+        let encoded = segments.map { seg -> String in
+            let plain = seg.removingPercentEncoding ?? seg
+            return plain.addingPercentEncoding(withAllowedCharacters: allowed) ?? ""
+        }.filter { !$0.isEmpty }
+        return encoded.isEmpty ? "" : "/" + encoded.joined(separator: "/")
+    }
+
     var isIPv6Literal: Bool { host.contains(":") }
 
     public var scheme: String { secure ? "https" : "http" }
@@ -77,10 +108,11 @@ public struct DaemonEndpoint: Hashable, Sendable {
     /// so the Host header is exactly what the TLS proxy expects.
     var urlPort: Int? { secure && port == DaemonEndpoint.defaultHTTPSPort ? nil : port }
 
-    /// "http://mac.local:7778", "https://mac.tailnet.ts.net"
+    /// "http://mac.local:7778", "https://mac.tailnet.ts.net",
+    /// "https://ref.supabase.co/functions/v1/aistatus"
     public var baseURLString: String {
         let h = isIPv6Literal ? "[\(host)]" : host
-        return "\(scheme)://\(h)" + (urlPort.map { ":\($0)" } ?? "")
+        return "\(scheme)://\(h)" + (urlPort.map { ":\($0)" } ?? "") + basePath
     }
 
     public func url(path: String) -> URL? {
@@ -92,7 +124,7 @@ public struct DaemonEndpoint: Hashable, Sendable {
             c.host = host
         }
         c.port = urlPort
-        c.percentEncodedPath = path
+        c.percentEncodedPath = basePath + path
         return c.url
     }
 

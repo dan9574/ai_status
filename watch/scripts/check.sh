@@ -37,14 +37,15 @@ fi
 TMPD="$(mktemp -d)"
 trap 'rm -rf "$TMPD"' EXIT
 X="$TMPD/Local.xcconfig"
-D_HOST="https://dummy-host.example.ts.net"
+# a full URL with a path, like the cloud hub (Supabase Edge Function)
+D_HOST="https://dummy-host.example.supabase.co/functions/v1/aistatus"
 D_TOKEN="dummy_TOKEN-0123456789abcdef"
 AISTATUS_LOCAL_XCCONFIG="$X" ./scripts/generate.sh --no-xcodegen --team DUMMYTEAM --prefix dev.check --host "$D_HOST" --token "$D_TOKEN" | grep -q '<set, hidden>' || fail "generate.sh must not echo the token"
 grep -v '^//' "$X" | grep -q '//' && fail "a value in $X contains '//' (would be cut off as a comment)"
 [ "$(stat -f %Lp "$X")" = 600 ] || fail "Local.xcconfig should be mode 600"
 # a later run with other options keeps host and token
 AISTATUS_LOCAL_XCCONFIG="$X" ./scripts/generate.sh --no-xcodegen --prefix dev.check2 >/dev/null
-grep -q '^AISTATUS_DEFAULT_HOST = https:/\$()/\$()dummy-host.example.ts.net$' "$X" || fail "host not kept/escaped: $(grep HOST "$X")"
+grep -q '^AISTATUS_DEFAULT_HOST = https:/\$()/\$()dummy-host.example.supabase.co/\$()functions/\$()v1/\$()aistatus$' "$X" || fail "host not kept/escaped: $(grep HOST "$X")"
 grep -q "^AISTATUS_DEFAULT_TOKEN = $D_TOKEN\$" "$X" || fail "token not kept"
 grep -q '^DEVELOPMENT_TEAM = DUMMYTEAM$' "$X" || fail "team not kept"
 AISTATUS_LOCAL_XCCONFIG="$X" ./scripts/generate.sh --no-xcodegen --token '$(EVIL)' >/dev/null 2>&1 && fail "bad token accepted"

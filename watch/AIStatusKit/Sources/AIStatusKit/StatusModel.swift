@@ -47,6 +47,12 @@ public final class StatusModel: ObservableObject {
     /// Short message for a failed user action (e.g. dismiss), cleared by the UI.
     @Published public var transientError: String?
     @Published public private(set) var endpoint: DaemonEndpoint?
+    /// The server offers no event stream (cloud hub): updates come from polling
+    /// every `pollInterval`, which is normal there and shown as fine. Learned
+    /// from the first `/events` answer; reset when the endpoint changes.
+    @Published public private(set) var streamUnavailable = false
+    /// Seconds between polls while there is no stream (Settings > Refresh).
+    public private(set) var pollInterval: TimeInterval
 
     /// Called with the most important transition of each snapshot (for haptics).
     public var onTransition: ((Transition) -> Void)?
@@ -71,7 +77,7 @@ public final class StatusModel: ObservableObject {
     private var feedTask: Task<Void, Never>?
     private var transport: DaemonTransport?
     private let makeTransport: (DaemonEndpoint) -> DaemonTransport
-    private let feedConfig: FeedConfig
+    private var feedConfig: FeedConfig
     private let sleeper: Sleeper
     private let now: () -> Date
 
@@ -82,12 +88,39 @@ public final class StatusModel: ObservableObject {
         makeTransport: @escaping (DaemonEndpoint) -> DaemonTransport = { URLSessionTransport(endpoint: $0) }
     ) {
         self.feedConfig = feedConfig
+        self.pollInterval = feedConfig.pollInterval
         self.sleeper = sleeper
         self.now = now
         self.makeTransport = makeTransport
     }
 
     public var isRunning: Bool { feedTask != nil }
+
+    /// Updates arrive by polling only (no stream offered, or SSE disabled).
+    public var pollingOnly: Bool { streamUnavailable || !feedConfig.useStream }
+
+    /// What the UI should show: polling is the normal mode when there is no
+    /// stream, so it is shown like a live connection (no indicator).
+    public var displayConnection: ConnectionState {
+        if pollingOnly, connection == .polling { return .live }
+        return connection
+    }
+
+    /// Whether to stop networking while the app is inactive (wrist down /
+    /// Always On): a poll costs a request each time (on the cloud hub: a billed
+    /// function invocation), an idle SSE connection costs nothing.
+    public var pausesWhenInactive: Bool { pollingOnly || connection == .polling }
+
+    /// Change the poll interval (1...600 s); restarts a running feed.
+    public func setPollInterval(_ seconds: TimeInterval) {
+        let v = min(600, max(1, seconds.isFinite ? seconds : 5))
+        guard v != pollInterval else { return }
+        pollInterval = v
+        if isRunning {
+            stop()
+            start(endpoint: endpoint)
+        }
+    }
 
     /// Start (or keep) the feed for `endpoint`. Changing endpoint resets all state.
     public func start(endpoint newEndpoint: DaemonEndpoint?) {
@@ -102,12 +135,16 @@ public final class StatusModel: ObservableObject {
             lastUpdate = nil
             clock.reset()
             connection = .connecting
+            streamUnavailable = false
         }
         guard feedTask == nil, let ep = endpoint else { return }
         let transport = makeTransport(ep)
         self.transport = transport
         if !hasData { connection = .connecting }
-        let stream = sessionFeed(transport: transport, config: feedConfig, sleep: sleeper)
+        var config = feedConfig
+        config.pollInterval = pollInterval
+        if streamUnavailable { config.useStream = false } // known: skip the /events attempt
+        let stream = sessionFeed(transport: transport, config: config, sleep: sleeper)
         feedTask = Task { [weak self] in
             for await event in stream {
                 guard let self, !Task.isCancelled else { break }
@@ -136,6 +173,8 @@ public final class StatusModel: ObservableObject {
             publishSummary()
         case .snapshot(let timed, _):
             ingest(timed)
+        case .streamUnavailable:
+            streamUnavailable = true
         }
     }
 

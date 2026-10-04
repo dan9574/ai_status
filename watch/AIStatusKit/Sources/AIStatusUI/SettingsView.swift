@@ -7,6 +7,7 @@ public struct SettingsView: View {
     @AppStorage(SettingsKeys.host) private var host = BuildDefaults.host
     @AppStorage(SettingsKeys.port) private var port = DaemonEndpoint.defaultPort
     @AppStorage(SettingsKeys.token) private var token = BuildDefaults.token
+    @AppStorage(SettingsKeys.pollSeconds) private var pollSeconds = PollIntervals.default
     @State private var testResult: String?
     @State private var testing = false
 
@@ -50,6 +51,14 @@ public struct SettingsView: View {
             }
 
             Section {
+                Picker("Refresh", selection: $pollSeconds) {
+                    ForEach(PollIntervals.choices, id: \.self) { Text("\($0) s").tag($0) }
+                }
+            } footer: {
+                Text("How often to ask for updates when the hub has no live stream (cloud hub). Only while the app is on screen.")
+            }
+
+            Section {
                 Button(testing ? "Testing…" : "Test connection") { runTest() }
                     .disabled(endpoint == nil || testing)
                 if let testResult {
@@ -58,7 +67,7 @@ public struct SettingsView: View {
                         .foregroundStyle(.secondary)
                 }
             } footer: {
-                Text("On the Mac: `scutil --get LocalHostName` shows the name; run `aistatus daemon`. Watch and Mac must be on the same network, or use the Mac's public https URL (`aistatus public-status`).")
+                Text("On the Mac: `scutil --get LocalHostName` shows the name; run `aistatus daemon`. Watch and Mac must be on the same network, or use the Mac's public https URL (`aistatus public-status`) or the cloud hub URL (`aistatus cloud status`).")
             }
         }
         .navigationTitle("Settings")

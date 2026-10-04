@@ -18,13 +18,24 @@ func runFeedChecks() async {
     }
 
     await asyncSuite("feed: SSE down, polling works") {
-        let t = FakeTransport(stream: .failImmediately(.http(status: 404, message: nil)), poll: .success(snapA))
+        let t = FakeTransport(stream: .failImmediately(.http(status: 502, message: nil)), poll: .success(snapA))
         let ev = await collect(sessionFeed(transport: t, config: cfg, sleep: fastSleeper)) { snapshotSources($0).count >= 6 }
         expectEqual(states(ev).first, .connecting, "starts connecting")
         check(states(ev).contains(.polling), "falls back to polling: \(states(ev))")
         check(!states(ev).contains { if case .unreachable = $0 { return true } else { return false } }, "never unreachable while polls succeed")
         check(snapshotSources(ev).allSatisfy { $0 == .poll }, "snapshots via poll")
         check(t.counts.streams >= 2, "SSE retried (\(t.counts.streams) opens)")
+    }
+
+    for answer in [DaemonError.http(status: 501, message: "no event stream"), .notFound, .http(status: 405, message: nil)] {
+        await asyncSuite("feed: no event stream offered (\(answer.errorDescription ?? "")): quiet polling, SSE never retried") {
+            let t = FakeTransport(stream: .failImmediately(answer), poll: .success(snapA))
+            let ev = await collect(sessionFeed(transport: t, config: cfg, sleep: fastSleeper)) { snapshotSources($0).count >= 4 }
+            expectEqual(states(ev), [.connecting, .polling], "connecting -> polling, nothing else")
+            check(ev.contains { if case .streamUnavailable = $0 { return true } else { return false } }, "reports streamUnavailable")
+            expectEqual(t.counts.streams, 1, "one /events attempt only")
+            check(snapshotSources(ev).allSatisfy { $0 == .poll }, "polls")
+        }
     }
 
     await asyncSuite("feed: Mac unreachable, then recovers") {
@@ -183,6 +194,43 @@ func runModelChecks() async {
         check(model.cards.contains { $0.id == long.id }, "failed dismiss restores the card")
         check(model.transientError?.contains("No network") == true, "error surfaced: \(model.transientError ?? "nil")")
         model.stop()
+    }
+
+    await asyncSuite("view model: cloud hub (no stream): polling shown as fine, paused when inactive, interval applied") {
+        let cloud = try Snapshot.decode(fixture("sessions-cloud.json"))
+        let fake = FakeTransport(stream: .failImmediately(.http(status: 501, message: nil)), poll: .success(cloud))
+        let model = StatusModel(sleeper: fastSleeper, makeTransport: { _ in fake })
+        let ep = DaemonEndpoint(host: "https://abcdefgh.supabase.co/functions/v1/aistatus", token: "t")
+        model.start(endpoint: ep)
+        try await waitUntil { model.hasData && model.streamUnavailable }
+        expectEqual(model.connection, .polling, "feed state is polling")
+        expectEqual(model.displayConnection, .live, "but shown without an indicator")
+        check(model.pollingOnly && model.pausesWhenInactive, "polling only; pauses when inactive")
+        expectEqual(model.cards.count, 3, "cards")
+        expectEqual(fake.counts.streams, 1, "one /events attempt")
+        model.stop()
+        model.start(endpoint: ep) // wrist raised again: no new /events attempt
+        try await Task.sleep(nanoseconds: 50_000_000)
+        expectEqual(fake.counts.streams, 1, "stream known to be unavailable: not asked again")
+        check(model.isRunning, "running")
+        model.setPollInterval(30)
+        expectEqual(model.pollInterval, 30, "interval set")
+        check(model.isRunning, "still running after the change")
+        model.setPollInterval(0)
+        expectEqual(model.pollInterval, 1, "clamped")
+        model.start(endpoint: DaemonEndpoint(host: "mac"))
+        check(!model.streamUnavailable, "endpoint change forgets it")
+        model.stop()
+
+        // A LAN daemon whose stream is up: stays connected while inactive.
+        let mixed = try Snapshot.decode(fixture("sessions-mixed.json"))
+        let lan = FakeTransport(stream: .deliver([mixed], thenFail: false), poll: .success(mixed))
+        let m2 = StatusModel(sleeper: fastSleeper, makeTransport: { _ in lan })
+        m2.start(endpoint: DaemonEndpoint(host: "mac"))
+        try await waitUntil { m2.hasData }
+        expectEqual(m2.connection, .live, "live")
+        check(!m2.pausesWhenInactive && !m2.pollingOnly, "SSE: keeps the connection while inactive")
+        m2.stop()
     }
 
     await asyncSuite("view model: unreachable keeps last data, endpoint change resets") {

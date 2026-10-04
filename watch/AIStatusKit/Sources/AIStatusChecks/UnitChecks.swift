@@ -2,6 +2,23 @@ import AIStatusKit
 import Foundation
 
 func runDecodingChecks() {
+    suite("decode the cloud hub's snapshot (Fixtures/sessions-cloud.json, written by test/cloud.test.js)") {
+        let snap = try Snapshot.decode(fixture("sessions-cloud.json"))
+        expectEqual(snap.sessions.count, 3, "three cards")
+        expectEqual(snap.sessions.map(\.status), [.waiting, .running, .done], "waiting, running, done")
+        check(snap.sessions.allSatisfy { $0.id == "\($0.tool.rawValue)@\($0.machine ?? "?"):\($0.sessionId)" }, "id = tool@machine:sessionId")
+        check(snap.sessions.allSatisfy { $0.project == nil && $0.cwd == nil && $0.lastMessage == nil }, "minimal data: no project, cwd or message")
+        expectEqual(snap.sessions[0].displayProject, "WIN-PC", "no project => the machine name")
+        expectEqual(snap.sessions[0].tool, .codex, "codex")
+        expectEqual(snap.sessions[0].waitingReason, .permission, "waiting reason")
+        let p = CardPresentation(card: snap.sessions[2], clock: ClockSync())
+        expectEqual(p.project, "Daniels-MacBook-Air", "detail title falls back to the machine")
+        check(p.message == nil, "no message line")
+        var noMachine = snap.sessions[1]
+        noMachine.machine = nil
+        expectEqual(noMachine.displayProject, "aaaaaaaa", "no machine either => short session id")
+    }
+
     suite("decode real daemon fixtures") {
         let empty = try Snapshot.decode(fixture("sessions-empty.json"))
         expectEqual(empty.sessions.count, 0, "empty snapshot has no sessions")
@@ -299,6 +316,34 @@ func runEndpointChecks() {
         check(DaemonEndpoint(host: "https://a.ts.net") != DaemonEndpoint(host: "http://a.ts.net", port: 443), "http and https endpoints differ (reconnect on change)")
         let v6 = DaemonEndpoint(host: "https://[fd7a::1]")!
         expectEqual(v6.sessionsURL?.absoluteString, "https://[fd7a::1]/sessions", "https IPv6")
+    }
+
+    suite("endpoint: base URL with a path (cloud hub, Supabase Edge Function)") {
+        let raw = "https://abcdefgh.supabase.co/functions/v1/aistatus"
+        let ep = DaemonEndpoint(host: raw, token: "tok")!
+        check(ep.secure, "https")
+        expectEqual(ep.host, "abcdefgh.supabase.co", "host")
+        expectEqual(ep.port, 443, "443")
+        expectEqual(ep.basePath, "/functions/v1/aistatus", "base path")
+        expectEqual(ep.baseURLString, raw, "base URL keeps the path")
+        expectEqual(ep.sessionsURL?.absoluteString, raw + "/sessions", "sessions URL")
+        expectEqual(ep.healthURL?.absoluteString, raw + "/health", "health URL")
+        expectEqual(ep.eventsURL?.absoluteString, raw + "/events", "events URL")
+        expectEqual(ep.dismissURL(id: "claude@Mac:a/b c")?.absoluteString, raw + "/sessions/claude%40Mac%3Aa%2Fb%20c/dismiss", "dismiss URL under the path, id encoded")
+        expectEqual(DaemonEndpoint(host: " " + raw + "/ ")?.baseURLString, raw, "trailing slash and spaces")
+        expectEqual(DaemonEndpoint(host: raw + "/sessions?x=1#f")?.sessionsURL?.absoluteString, raw + "/sessions", "pasted route name, query, fragment dropped")
+        expectEqual(DaemonEndpoint(host: raw + "//")?.basePath, "/functions/v1/aistatus", "double slash")
+        expectEqual(DaemonEndpoint(host: "https://h.example/a b/ü")?.basePath, "/a%20b/%C3%BC", "percent-encoded")
+        expectEqual(DaemonEndpoint(host: "https://h.example/a%20b")?.basePath, "/a%20b", "already encoded stays")
+        expectEqual(DaemonEndpoint(host: "https://h.example/../x/./y")?.basePath, "/x/y", "no dot segments")
+        expectEqual(DaemonEndpoint(host: "https://h.example:8443/base")?.sessionsURL?.absoluteString, "https://h.example:8443/base/sessions", "port and path")
+        expectEqual(DaemonEndpoint(host: "mymac")?.basePath, "", "bare name: no path")
+        expectEqual(DaemonEndpoint(host: "[fe80::1]:8000")?.basePath, "", "IPv6 literal: no path")
+        expectEqual(DaemonEndpoint(host: "https://mac.tail1234.ts.net")?.basePath, "", "tunnel URL: no path")
+        check(DaemonEndpoint(host: raw) != DaemonEndpoint(host: "https://abcdefgh.supabase.co"), "different paths are different endpoints (reconnect on change)")
+        let fromBuild = DaemonEndpoint(host: BuildDefaults.host(in: ["AIStatusDefaultHost": raw]), token: "t")
+        expectEqual(fromBuild?.sessionsURL?.absoluteString, raw + "/sessions", "built-in default host with a path")
+        expectEqual("https:/$()/$()abcdefgh.supabase.co/$()functions/$()v1/$()aistatus".replacingOccurrences(of: "$()", with: ""), raw, "generate.sh escape of a URL with a path")
     }
 
     suite("build-time defaults (Info.plist via xcconfig)") {

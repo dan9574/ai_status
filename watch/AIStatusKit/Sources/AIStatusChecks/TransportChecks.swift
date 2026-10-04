@@ -24,10 +24,12 @@ final class RecordingURLProtocol: URLProtocol {
         let path = request.url?.path ?? ""
         var type = "application/json"
         let body: Data
-        switch path {
-        case "/sessions": body = (try? fixture("sessions-mixed.json")) ?? Data()
-        case "/health": body = (try? fixture("health.json")) ?? Data()
-        case "/events":
+        // Match the last segment: endpoints may have a base path (cloud hub).
+        let route = path.hasSuffix("/dismiss") ? "dismiss" : String(path.split(separator: "/").last ?? "")
+        switch route {
+        case "sessions": body = (try? fixture("sessions-mixed.json")) ?? Data()
+        case "health": body = (try? fixture("health.json")) ?? Data()
+        case "events":
             type = "text/event-stream"
             let json = (try? fixture("sessions-empty.json")).flatMap { String(data: $0, encoding: .utf8) } ?? "{}"
             let oneLine = json.replacingOccurrences(of: "\n", with: "")
@@ -74,6 +76,21 @@ func runTransportChecks() async {
         }
         expectEqual(reqs.last?.value(forHTTPHeaderField: "Accept"), "text/event-stream", "SSE Accept header")
         expectEqual(reqs.first { $0.url?.path.hasSuffix("/dismiss") == true }?.httpMethod, "POST", "dismiss is a POST")
+    }
+
+    await asyncSuite("transport: base URL with a path (cloud hub): every request under the path") {
+        RecordingURLProtocol.reset()
+        let cfg = URLSessionConfiguration.ephemeral
+        cfg.protocolClasses = [RecordingURLProtocol.self]
+        let ep = DaemonEndpoint(host: "https://abcdefgh.supabase.co/functions/v1/aistatus", token: "dummy-token-0123456789")!
+        let t = URLSessionTransport(endpoint: ep, session: URLSession(configuration: cfg))
+        _ = try await t.health()
+        let snap = try await t.fetchSnapshot()
+        try await t.dismiss(id: "codex@WIN:abc")
+        expectEqual(snap.snapshot.sessions.count, 8, "decoded")
+        let reqs = RecordingURLProtocol.requests
+        expectEqual(reqs.map { $0.url?.path ?? "" }, ["/functions/v1/aistatus/health", "/functions/v1/aistatus/sessions", "/functions/v1/aistatus/sessions/codex@WIN:abc/dismiss"], "paths under the base path")
+        check(reqs.allSatisfy { $0.url?.host == "abcdefgh.supabase.co" && $0.value(forHTTPHeaderField: "Authorization") == "Bearer dummy-token-0123456789" }, "host + Bearer on every request")
     }
 
     await asyncSuite("transport: no token => no Authorization header") {
