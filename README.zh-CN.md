@@ -77,7 +77,7 @@ node bin/aistatus.js                        # 另开终端：实时卡片视图�
 - `hookToken`：只用于别的电脑推送钩子（`POST /hook/:tool`）。设置后远程钩子必须带它（此时 `token` 不再被远程钩子接受），读取接口不受影响。`token` 和 `hookToken` 都没设时，远程钩子一律 `403`。
 - `publicPort`：公网监听端口（给 Tailscale Funnel 之类的隧道用），**只绑定 127.0.0.1**，只有配置了（至少 16 个字符的）`token` 或 `hookToken` 才会启动，否则不启动并在日志里写明原因；设为 `false` 关闭。这个端口上**不按来源地址信任任何请求**，见[公网地址](#公网地址tailscale-funnel)。
 - `publicUrl`：隧道的公网地址（`aistatus public-url` 写入），只给 `remote-setup` / `public-status` 用。
-- `machine`：本机在卡片 `machine` 字段里的名字，默认取主机名去掉 `.local`（例如 `DanieldeMacBook-Air-2`）。
+- `machine`：本机在卡片 `machine` 字段里的名字，默认取主机名去掉 `.local`（例如 `MyMac`）。
 - `subagentTimeoutMin`：主回合已结束、但子代理还在跑的会话保持 running；若这么多分钟内没有任何事件（例如丢了 `SubagentStop`），按最后一次事件的时间记为 done。
 - `codex.source`：`auto`（钩子优先，会话文件监听兜底）/ `hooks` / `watcher`。
 - 环境变量覆盖：`AISTATUS_PORT`、`AISTATUS_HOST`、`AISTATUS_PUBLIC_PORT`（`off` 关闭）、`AISTATUS_BONJOUR=0`、`AISTATUS_CODEX_SOURCE`、`AISTATUS_DIR`（数据目录）。
@@ -122,7 +122,7 @@ Bonjour：`_aistatus._tcp`，实例名 `aistatus@<主机名>`，TXT：`path=/ses
       "id": "claude:2f1c…",
       "tool": "claude",
       "sessionId": "2f1c…",
-      "machine": "DanieldeMacBook-Air-2",
+      "machine": "MyMac",
       "project": "ai_status",
       "cwd": "/Users/me/projects/ai_status",
       "status": "running",
@@ -182,7 +182,7 @@ data: {"version":1,"serverTime":…,"sessions":[…]}
 
 ### `GET /health`
 
-`{"ok":true,"name":"aistatusd","version":"0.1.0","machine":"DanieldeMacBook-Air-2","remoteHooks":false,"pid":…,"startedAt":…,"serverTime":…,"sessions":3,"sseClients":1}`
+`{"ok":true,"name":"aistatusd","version":"0.1.0","machine":"MyMac","remoteHooks":false,"pid":…,"startedAt":…,"serverTime":…,"sessions":3,"sseClients":1}`
 
 `remoteHooks`：当前进程是否接受别的电脑推送钩子（配置了 `hookToken` 或 `token`）。局域网端口上还有 `"public":{"listening":true,"port":7779,"read":true,"hook":true}`（公网监听端口的状态）。
 
@@ -606,7 +606,7 @@ test/hub.test.js, test/hub-bundle.test.js, test/cloud.test.js, test/senders.test
 
 预览图（macOS 上离屏渲染，40 mm = 162×197 pt，44 mm = 184×224 pt；右上角的 10:09、详情页左上角的 ✕ 和圆角是模拟的系统元素和屏幕形状）：[`watch/previews/`](watch/previews)——`tiles-0/1/2/3/4/6`、`tiles-3-swiped` / `tiles-4-swiped`（左滑露出垃圾桶）、`detail-done/ask/run`、`tiles-3-offline`、`tiles-4-always-on`、各状态页，总览见 `overview-40mm.png` / `overview-44mm.png`。
 
-- **设置**：主机、端口（默认 7778）、token（可选），`@AppStorage` 持久化。主机只写名字会自动补 `.local`（`Daniels-MacBook-Air` → `Daniels-MacBook-Air.local`），也接受 IP、`host:port`、带 `http://` 的写法，以及完整的 `https://` 地址（例如 Funnel 地址；不写端口即 443，此时设置里的端口不用）；“Test connection” 调 `/health`。构建时 `generate.sh` 会把默认主机（本机的 Bonjour 名，或 `--host` 给的地址）和 `--token` 给的 token 写进 Info.plist（`AIStatusDefaultHost` / `AIStatusDefaultToken`），**手表上通常不用打字**；用户在设置里改过的值优先，设置里有 “Use …” / “Use built-in token” 按钮恢复成内置值。所有请求（包括 SSE）都带 `Authorization: Bearer <token>`。
+- **设置**：主机、端口（默认 7778）、token（可选），`@AppStorage` 持久化。主机只写名字会自动补 `.local`（`my-mac` → `my-mac.local`），也接受 IP、`host:port`、带 `http://` 的写法，以及完整的 `https://` 地址（例如 Funnel 地址；不写端口即 443，此时设置里的端口不用）；“Test connection” 调 `/health`。构建时 `generate.sh` 会把默认主机（本机的 Bonjour 名，或 `--host` 给的地址）和 `--token` 给的 token 写进 Info.plist（`AIStatusDefaultHost` / `AIStatusDefaultToken`），**手表上通常不用打字**；用户在设置里改过的值优先，设置里有 “Use …” / “Use built-in token” 按钮恢复成内置值。所有请求（包括 SSE）都带 `Authorization: Bearer <token>`。
 - **小组件**：`accessoryRectangular / Circular / Inline / Corner`，显示 running / waiting / done 计数和“as of 时间”；数据来自应用最后一次写入 App Group 的快照（计数变化时才刷新时间线）。小组件自己不联网，所以它只和你上次打开应用时一样新（后台刷新是阶段三）。
 
 ### 网络

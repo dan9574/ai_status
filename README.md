@@ -77,7 +77,7 @@ node bin/aistatus.js                        # in another terminal: live card vie
 - `hookToken`: used only for other computers pushing hooks (`POST /hook/:tool`). When set, remote hooks must carry it (`token` is then no longer accepted for remote hooks); read endpoints are unaffected. When neither `token` nor `hookToken` is set, remote hooks always get `403`.
 - `publicPort`: the public listener port (for tunnels such as Tailscale Funnel). It **binds only to 127.0.0.1** and starts only when a `token` or `hookToken` (of at least 16 characters) is configured; otherwise it does not start and the reason is written to the log. Set it to `false` to turn it off. On this port **no request is trusted based on its source address**, see [Public address](#public-address-tailscale-funnel).
 - `publicUrl`: the tunnel's public address (written by `aistatus public-url`), only used by `remote-setup` / `public-status`.
-- `machine`: this machine's name in the card's `machine` field; defaults to the hostname with `.local` removed (e.g. `DanieldeMacBook-Air-2`).
+- `machine`: this machine's name in the card's `machine` field; defaults to the hostname with `.local` removed (e.g. `MyMac`).
 - `subagentTimeoutMin`: a session whose main turn has ended but whose subagents are still running stays running; if there are no events at all for this many minutes (e.g. a `SubagentStop` was lost), it is marked done using the time of the last event.
 - `codex.source`: `auto` (hooks first, session-file watching as fallback) / `hooks` / `watcher`.
 - Environment variable overrides: `AISTATUS_PORT`, `AISTATUS_HOST`, `AISTATUS_PUBLIC_PORT` (`off` to disable), `AISTATUS_BONJOUR=0`, `AISTATUS_CODEX_SOURCE`, `AISTATUS_DIR` (data directory).
@@ -122,7 +122,7 @@ Bonjour: `_aistatus._tcp`, instance name `aistatus@<hostname>`, TXT: `path=/sess
       "id": "claude:2f1c…",
       "tool": "claude",
       "sessionId": "2f1c…",
-      "machine": "DanieldeMacBook-Air-2",
+      "machine": "MyMac",
       "project": "ai_status",
       "cwd": "/Users/me/projects/ai_status",
       "status": "running",
@@ -182,7 +182,7 @@ Clears a card. `:id` is the `id` (URL-encoded, e.g. `claude%3A2f1c…`); a sessi
 
 ### `GET /health`
 
-`{"ok":true,"name":"aistatusd","version":"0.1.0","machine":"DanieldeMacBook-Air-2","remoteHooks":false,"pid":…,"startedAt":…,"serverTime":…,"sessions":3,"sseClients":1}`
+`{"ok":true,"name":"aistatusd","version":"0.1.0","machine":"MyMac","remoteHooks":false,"pid":…,"startedAt":…,"serverTime":…,"sessions":3,"sseClients":1}`
 
 `remoteHooks`: whether the current process accepts hooks pushed from other computers (`hookToken` or `token` configured). The LAN port also includes `"public":{"listening":true,"port":7779,"read":true,"hook":true}` (the state of the public listener port).
 
@@ -606,7 +606,7 @@ Timer format `0:41` / `12:34` / `1:05:12`, and `1d 2h` beyond a day; refreshed e
 
 Preview images (rendered off-screen on macOS, 40 mm = 162×197 pt, 44 mm = 184×224 pt; the 10:09 in the top-right corner, the ✕ in the top-left of the detail page, and the rounded corners are simulated system elements and screen shape): [`watch/previews/`](watch/previews) — `tiles-0/1/2/3/4/6`, `tiles-3-swiped` / `tiles-4-swiped` (swiped left to reveal the trash can), `detail-done/ask/run`, `tiles-3-offline`, `tiles-4-always-on`, and the various state pages; for an overview see `overview-40mm.png` / `overview-44mm.png`.
 
-- **Settings**: host, port (default 7778), token (optional), persisted with `@AppStorage`. A bare host name gets `.local` appended automatically (`Daniels-MacBook-Air` → `Daniels-MacBook-Air.local`); IPs, `host:port`, forms with `http://`, and full `https://` addresses (e.g. a Funnel address; without a port it is 443, and the port in settings is then unused) are also accepted; "Test connection" calls `/health`. At build time, `generate.sh` writes the default host (this machine's Bonjour name, or the address given with `--host`) and the token given with `--token` into Info.plist (`AIStatusDefaultHost` / `AIStatusDefaultToken`), so **you usually don't have to type anything on the watch**; values the user changed in settings take precedence, and settings have "Use …" / "Use built-in token" buttons to restore the built-in values. All requests (including SSE) carry `Authorization: Bearer <token>`.
+- **Settings**: host, port (default 7778), token (optional), persisted with `@AppStorage`. A bare host name gets `.local` appended automatically (`my-mac` → `my-mac.local`); IPs, `host:port`, forms with `http://`, and full `https://` addresses (e.g. a Funnel address; without a port it is 443, and the port in settings is then unused) are also accepted; "Test connection" calls `/health`. At build time, `generate.sh` writes the default host (this machine's Bonjour name, or the address given with `--host`) and the token given with `--token` into Info.plist (`AIStatusDefaultHost` / `AIStatusDefaultToken`), so **you usually don't have to type anything on the watch**; values the user changed in settings take precedence, and settings have "Use …" / "Use built-in token" buttons to restore the built-in values. All requests (including SSE) carry `Authorization: Bearer <token>`.
 - **Widget**: `accessoryRectangular / Circular / Inline / Corner`, showing running / waiting / done counts and an "as of time"; the data comes from the snapshot the app last wrote to the App Group (the timeline is only refreshed when the counts change). The widget does not go online itself, so it is only as fresh as the last time you opened the app (background refresh is Phase 3).
 
 ### Networking
