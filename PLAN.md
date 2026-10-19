@@ -39,7 +39,7 @@
    - iPhone 伴侣应用 + 实时活动，自动出现在手表智能叠放。
    - 传输二选一：蓝牙（免服务器，仅近场）或从 Mac 直接发苹果推送（需付费开发者账号）。
 5. **公网地址**（分支 `public-endpoint`，接在阶段三之后）
-   - 学校 Wi-Fi 禁止设备互访，改用 Tailscale Funnel 把守护进程放到固定的公网 HTTPS 地址（`https://danielmacbook-air.tail66228a.ts.net`），Funnel 由用户自己开：`tailscale funnel --bg 7779`。
+   - 学校 Wi-Fi 禁止设备互访，改用 Tailscale Funnel 把守护进程放到固定的公网 HTTPS 地址（`https://<your-mac>.<your-tailnet>.ts.net`），Funnel 由用户自己开：`tailscale funnel --bg 7779`。
    - 守护进程新增**公网监听端口** `publicPort`（默认 7779，只绑 127.0.0.1，没有 token 不启动）：不按来源地址信任，所有接口都要 Bearer token（`?token=` 不接受），读取/dismiss 用 `token`，钩子用 `hookToken`（没有则 `token`）；未认证的 `/health` 只回 `{"ok":true}`；不提供 `/setup`；钩子一律算远程；请求体 1 MiB、SSE 8 个、错误 token 限流、日志不含 token。`7778` 行为不变。
    - CLI：`token --read` / `--new --shared`、`public-url`、`public-status`、`remote-setup` 打印 `-BaseUrl` 安装命令。
    - 手表：主机可填 `https://…`（默认 443），所有请求带 token；`generate.sh --host <url> --token <token>` 编进 Info.plist，手表上不用输入。

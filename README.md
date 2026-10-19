@@ -2,6 +2,19 @@
 
 在本机追踪每个 Claude Code / Codex 会话的实时状态（running / waiting / done），通过局域网 HTTP API 提供给阶段二的 watchOS 应用。Node 22，零 npm 依赖。设计见 [PLAN.md](PLAN.md)。手表应用见下文[阶段二：watchOS 应用](#阶段二watchos-应用)。另一台电脑（Windows 上的 Codex 桌面版）也可以把会话汇报给这台 Mac，见[多台电脑（Windows）](#多台电脑windows)。不想让 Mac 一直开着当中心时，可以改用 Supabase 上的云端中转，见[云端中转（Supabase）](#云端中转supabase)。
 
+## 预览
+
+抬腕一眼看清每个 Claude Code / Codex 会话的状态：灰 = 运行中、橙 = 等待审批、绿 = 已完成，格子按会话数自动切成 1 / 2 / 3 条或田字格。点一格看详情，左滑删除。
+
+![各状态总览](preview/overview.png)
+
+| 三个会话 | 田字格 | 左滑删除 | 详情 |
+|---|---|---|---|
+| ![](preview/three-sessions.png) | ![](preview/four-sessions-grid.png) | ![](preview/swipe-to-delete.png) | ![](preview/detail-done.png) |
+
+更多渲染图在 `watch/previews/`。
+
+
 ## 安装与运行
 
 ```sh
@@ -33,7 +46,7 @@ node bin/aistatus.js                        # 另开终端：实时卡片视图�
 | `aistatus install-daemon [--print]` | 生成 launchd plist（不加载） |
 | `aistatus token [--read] [--new [--hooks-only \| --shared]]` | 打印远程钩子要用的 token（`--read`：手表要用的 `token`）；`--new` 生成并保存 `token`，`--new --hooks-only` 生成 `hookToken`，`--new --shared` 生成 `token` 并删除 `hookToken`（一个 token 管所有）（见[多台电脑](#多台电脑windows)、[公网地址](#公网地址tailscale-funnel)） |
 | `aistatus remote-setup [--public-url URL]` | 打印另一台电脑需要的全部信息：Mac 局域网 IP、端口、token、Windows 安装命令；配置了 `publicUrl` 时安装命令改用 `-BaseUrl <公网地址>` |
-| `aistatus public-url [URL \| --clear]` | 查看 / 保存公网地址（例如 `https://danielmacbook-air.tail66228a.ts.net`），只给 CLI 用，守护进程不读 |
+| `aistatus public-url [URL \| --clear]` | 查看 / 保存公网地址（例如 `https://<your-mac>.<your-tailnet>.ts.net`），只给 CLI 用，守护进程不读 |
 | `aistatus public-status [--show] [--no-probe]` | 公网监听端口是否在运行、token 是否已设置（`--show` 才打印 token 本身）、本机和公网地址的 `/health` 能否访问 |
 | `aistatus cloud setup --url URL --hook-token T [--read-token T] [--machine NAME] [--no-probe]` | 云端模式：钩子改发到云端中转（Supabase Edge Function），见[云端中转](#云端中转supabase) |
 | `aistatus cloud status [--show] [--no-probe]` / `cloud off` / `cloud on` | 云端配置与连通性检查 / 切回本地守护进程 / 切回云端 |
@@ -292,7 +305,7 @@ Codex 对新钩子按定义的哈希做信任校验，未信任的钩子会被�
 
 ## 公网地址（Tailscale Funnel）
 
-学校 / 公司 Wi-Fi 常常禁止设备之间互访（客户端隔离），手表（经 iPhone）和 Windows 电脑都连不到 Mac 的 `7778`。办法：用 **Tailscale Funnel** 把守护进程放到一个固定的公网 HTTPS 地址上，例如 `https://danielmacbook-air.tail66228a.ts.net`。Funnel 在 Tailscale 那边终止 TLS，再把请求转发到 Mac 上 `127.0.0.1` 的一个端口。
+学校 / 公司 Wi-Fi 常常禁止设备之间互访（客户端隔离），手表（经 iPhone）和 Windows 电脑都连不到 Mac 的 `7778`。办法：用 **Tailscale Funnel** 把守护进程放到一个固定的公网 HTTPS 地址上，例如 `https://<your-mac>.<your-tailnet>.ts.net`。Funnel 在 Tailscale 那边终止 TLS，再把请求转发到 Mac 上 `127.0.0.1` 的一个端口。
 
 ```
 手表 ─HTTPS─┐                          ┌→ 127.0.0.1:7779 公网监听端口（每个请求都要 token）
@@ -338,19 +351,19 @@ Windows ─HTTPS┴→ Tailscale Funnel 中继 ─┘   127.0.0.1/局域网:7778
 2. **Mac：打开 Funnel（你自己执行，aistatus 不会碰 Tailscale）**
    ```sh
    tailscale funnel --bg 7779
-   node bin/aistatus.js public-url https://danielmacbook-air.tail66228a.ts.net
+   node bin/aistatus.js public-url https://<your-mac>.<your-tailnet>.ts.net
    node bin/aistatus.js public-status              # public probe: … HTTP 200 {"ok":true}，with token: OK
    ```
    注意是 `7779`（公网监听端口），**不要**把 Funnel 指向 `7778`。
 3. **手表：把地址和 token 编进应用**（不用在手表上输入 32 位 token）
    ```sh
    cd watch
-   ./scripts/generate.sh --host https://danielmacbook-air.tail66228a.ts.net --token "$(node ../bin/aistatus.js token --read)"
+   ./scripts/generate.sh --host https://<your-mac>.<your-tailnet>.ts.net --token "$(node ../bin/aistatus.js token --read)"
    ```
    然后在 Xcode 里重新装到手表。`https://` 地址不写端口就是 443（设置里的端口只用于局域网 http）。如果以前在手表设置里改过主机或 token，手表会继续用你改过的值：长按 → 设置，点 “Use https://…” 和 “Use built-in token”。
 4. **Windows：改用公网地址**：`aistatus remote-setup` 会打印带 `-BaseUrl` 的安装命令。新版转发脚本必须到 Windows 上（旧版不认 `url`）：在和 Mac 同一网络时用一行命令安装（它从局域网端口下载脚本；公网地址不提供脚本），或者把 `hooks\aistatus-hook.ps1`、`scripts\install-windows.ps1` 拷过去执行：
    ```bat
-   powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\install-windows.ps1 -BaseUrl https://danielmacbook-air.tail66228a.ts.net -Token "<hookToken>"
+   powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\install-windows.ps1 -BaseUrl https://<your-mac>.<your-tailnet>.ts.net -Token "<hookToken>"
    ```
    配置文件多了 `"url"`，转发脚本优先用它（`https`、不写端口，显式开启 TLS 1.2，每步超时 1.4 秒）；`-MacHost <ip>` 且不带 `-BaseUrl` 重新运行即切回局域网。**钩子命令行和 `timeout` 没变，`hooks.json` 里的条目和以前完全一样，Codex 不需要重新信任**（只要 Windows 上已经装过阶段三的版本）。
 
@@ -483,7 +496,7 @@ cd watch
 ### 回滚
 
 - **Mac**：`node bin/aistatus.js cloud off`，钩子立刻改回发给本地守护进程（守护进程要在运行）。`cloud on` 再切回云端（配置还在）。
-- **Windows**：用原来的地址重新运行安装脚本，例如 `-BaseUrl https://danielmacbook-air.tail66228a.ts.net -Token "<hookToken>"` 或 `-MacHost <ip>`。新版脚本对守护进程同样适用（过滤规则对守护进程的结果一样）。
+- **Windows**：用原来的地址重新运行安装脚本，例如 `-BaseUrl https://<your-mac>.<your-tailnet>.ts.net -Token "<hookToken>"` 或 `-MacHost <ip>`。新版脚本对守护进程同样适用（过滤规则对守护进程的结果一样）。
 - **手表**：用原来的 `--host` / `--token` 重新 `generate.sh` 并安装，或在手表设置里改。
 - **代码**：改动前的版本打了标签 `v1-mac-hub-tailscale`（`git checkout v1-mac-hub-tailscale`）。守护进程的 `state.json` 格式没有变。
 - **Supabase**：删除函数 `aistatus`；SQL Editor 里 `drop table public.aistatus_sessions;`。
